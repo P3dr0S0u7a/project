@@ -1,0 +1,33 @@
+@staticmethod
+def pipeline_transformacao(dfs, locators):
+    """Executa transformações dinâmicas para cada sistema com base nas configurações JSON"""
+
+    for sistema, df in dfs.items():
+        if df is None or df.empty:
+            continue
+
+        WebScrapping.log(f"🔧 Executando transformações para '{sistema}'", "INFO")
+        sistema_conf = locators.get(sistema, {})
+        transformations = sistema_conf.get("transformations", {}).get("type", {})
+
+        for transform_name, config in transformations.items():
+            if transform_name not in action_transforms_map:
+                continue
+
+            func_name = action_transforms_map[transform_name]
+            func = getattr(WebScrapping, func_name, None)
+
+            if func is None:
+                WebScrapping.log(f"⚠️ Função {func_name} não encontrada", "WARNING")
+                continue
+
+            WebScrapping.log(f"➡️ Aplicando transformação '{transform_name}'")
+            try:
+                df = func(df, config)
+            except Exception as e:
+                WebScrapping.log(f"❌ Erro ao aplicar transformação '{transform_name}': {e}", "ERROR")
+
+        dfs[sistema] = df
+        WebScrapping.log(f"✅ Transformações concluídas para '{sistema}'", "INFO")
+
+    return dfs
