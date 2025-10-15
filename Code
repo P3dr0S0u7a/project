@@ -1,33 +1,114 @@
 @staticmethod
 def pipeline_transformacao(dfs, locators):
-    """Executa transformações dinâmicas para cada sistema com base nas configurações JSON"""
+    """Pipeline genérico de transformações configuradas via JSON"""
+    transforms_map = locators["__config__"]["action_transforms_map"]
 
     for sistema, df in dfs.items():
         if df is None or df.empty:
             continue
 
         WebScrapping.log(f"🔧 Executando transformações para '{sistema}'", "INFO")
-        sistema_conf = locators.get(sistema, {})
-        transformations = sistema_conf.get("transformations", {}).get("type", {})
+        transformations = locators.get(sistema, {}).get("transformations", {}).get("type", {})
 
         for transform_name, config in transformations.items():
-            if transform_name not in action_transforms_map:
+            func_name = transforms_map.get(transform_name)
+            if not func_name or not hasattr(TransformActions, func_name):
                 continue
 
-            func_name = action_transforms_map[transform_name]
-            func = getattr(WebScrapping, func_name, None)
+            func = getattr(TransformActions, func_name)
+            df = func(df, config)
 
-            if func is None:
-                WebScrapping.log(f"⚠️ Função {func_name} não encontrada", "WARNING")
-                continue
-
-            WebScrapping.log(f"➡️ Aplicando transformação '{transform_name}'")
-            try:
-                df = func(df, config)
-            except Exception as e:
-                WebScrapping.log(f"❌ Erro ao aplicar transformação '{transform_name}': {e}", "ERROR")
+        # Subtransformações aninhadas, como modify_strings.configs
+        modify_cfgs = transformations.get("modify_strings", {}).get("configs", [])
+        for cfg in modify_cfgs:
+            for sub_name, sub_cfg in cfg.items():
+                func_name = transforms_map.get(sub_name)
+                if func_name and hasattr(TransformActions, func_name):
+                    func = getattr(TransformActions, func_name)
+                    df = func(df, sub_cfg)
 
         dfs[sistema] = df
-        WebScrapping.log(f"✅ Transformações concluídas para '{sistema}'", "INFO")
-
     return dfs
+
+import pandas as pd
+import numpy as np
+
+class TransformActions:
+
+    @staticmethod
+    def action_transform_conditional_new_column(df, config):
+        """Cria nova coluna baseada em uma condição sobre outra coluna"""
+        src_cfg = config.get("source_column", {})
+        column = src_cfg.get("column")
+        target_column = src_cfg.get("target_column")
+        cond = src_cfg.get("condition", {})
+
+        if column not in df.columns:
+            return df
+
+        case_insensitive = cond.get("case_insensitive", True)
+        contains_val = cond.get("contains", "")
+        val_true = cond.get("value_if_True", None)
+        val_false = cond.get("value_if_False", None)
+
+        mask = df[column].astype(str).str.contains(
+            contains_val, case=not case_insensitive, na=False
+        )
+
+        df[target_column] = np.where(mask, val_true, val_false)
+        return df
+
+
+    @staticmethod
+    def action_transform_replace_values(df, config):
+        """Substitui valores inteiros/exatos em colunas"""
+        src_cfg = config.get("source_column", {})
+        column = src_cfg.get("column")
+        replacements = src_cfg.get("replacements", {})
+
+        if column in df.columns:
+            df[column] = df[column].replace(replacements)
+        return df
+
+
+    @staticmethod
+    def action_transform_replace_strings(df, config):
+        """Substitui partes de strings em colunas"""
+        src_cfg = config.get("source_column", {})
+        column = src_cfg.get("column")
+        replacements = src_cfg.get("replacements", {})
+
+        if column not in df.columns:
+            return df
+
+        df[column] = df[column].astype(str)
+        for old, new in replacements.items():
+            df[column] = df[column].str.replace(old, new, regex=False)
+        return df
+
+
+    @staticmethod
+    def action_transform_uppercase(df, config):
+        """Transforma coluna em maiúsculas"""
+        column = config.get("target_column")
+        if column in df.columns:
+            df[column] = df[column].astype(str).str.upper()
+        return df
+
+
+    @staticmethod
+    def action_transform_parse_dates(df, config):
+        """Converte colunas para datetime"""
+        columns = config.get("columns", [])
+        for col in columns:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+        return df
+
+
+    @staticmethod
+    def action_transform_ignore_select_columns(df, config):
+        """Remove colunas desnecessárias ou nulas"""
+        cols = config.get("columns", [])
+        df = df.drop(columns=[c for c in cols if c in df.columns], errors="ignore")
+        return df
