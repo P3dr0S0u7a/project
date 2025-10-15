@@ -1,0 +1,76 @@
+class WebScrapping:
+    @staticmethod
+    def pipeline_transformacao(dfs, locators):
+        """
+        Pipeline de transformação dinâmico baseado em transformations do locators.
+        Lê as transformações de cada sistema e executa conforme o dicionário JSON.
+        """
+        for sistema, df in dfs.items():
+            if df is None or df.empty:
+                continue
+
+            WebScrapping.log(f"🔧 Executando transformações para '{sistema}'", "INFO")
+
+            sistema_conf = locators.get(sistema, {})
+            transformations = sistema_conf.get("transformations", {})
+            if not transformations:
+                WebScrapping.log(f"⚠️ Nenhuma transformação definida para '{sistema}'", "WARNING")
+                continue
+
+            # ✅ Mapeamento de ações de transformação — prioriza o nível do sistema, depois o global
+            transforms_map = (
+                sistema_conf.get("action_transforms_map")
+                or locators.get("__config__", {}).get("action_transforms_map", {})
+            )
+
+            for nome_transformacao, config in transformations.items():
+                WebScrapping.log(f"➡️ Aplicando transformação '{nome_transformacao}'", "DEBUG")
+
+                if not isinstance(config, dict):
+                    WebScrapping.log(f"⚠️ Estrutura inesperada em '{nome_transformacao}'", "WARNING")
+                    continue
+
+                # 1️⃣ Método dinâmico (como extract_method)
+                if "method" in config and isinstance(config["method"], dict):
+                    metodo_cfg = config["method"]
+                    metodo_nome = metodo_cfg.get("name")
+                    func_name = transforms_map.get("method")
+
+                    if func_name and hasattr(WebScrapping, func_name):
+                        WebScrapping.log(f"⚙️ Executando método '{metodo_nome}'", "DEBUG")
+                        try:
+                            getattr(WebScrapping, func_name)(df, metodo_cfg, locators)
+                        except Exception as e:
+                            WebScrapping.log(f"❌ Erro ao executar método '{metodo_nome}': {e}", "ERROR")
+                    else:
+                        WebScrapping.log(f"⚠️ Método '{metodo_nome}' não mapeado em action_transforms_map", "WARNING")
+
+                # 2️⃣ Configurações genéricas (replace_values, normalize, etc.)
+                elif "configs" in config and isinstance(config["configs"], list):
+                    for item in config["configs"]:
+                        if isinstance(item, dict):
+                            for tipo_acao, parametros in item.items():
+                                WebScrapping.log(f"🛠️ Executando ação '{tipo_acao}'", "DEBUG")
+                                func_name = transforms_map.get(tipo_acao)
+
+                                if func_name and hasattr(WebScrapping, func_name):
+                                    try:
+                                        getattr(WebScrapping, func_name)(df, parametros)
+                                    except Exception as e:
+                                        WebScrapping.log(f"❌ Erro ao executar ação '{tipo_acao}': {e}", "ERROR")
+                                else:
+                                    WebScrapping.log(f"⚠️ Ação '{tipo_acao}' não mapeada no action_transforms_map", "WARNING")
+
+                # 3️⃣ Remoção de colunas (ignore_select_columns)
+                elif "columns" in config and isinstance(config["columns"], list):
+                    cols_to_drop = [c for c in config["columns"] if c in df.columns]
+                    if cols_to_drop:
+                        df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
+                        WebScrapping.log(f"🧹 Colunas removidas: {cols_to_drop}", "DEBUG")
+
+                else:
+                    WebScrapping.log(f"⚠️ Estrutura inesperada em '{nome_transformacao}': {config}", "WARNING")
+
+            WebScrapping.log(f"✅ Transformações concluídas para '{sistema}'", "INFO")
+
+        return dfs
