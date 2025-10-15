@@ -1,114 +1,87 @@
-@staticmethod
-def pipeline_transformacao(dfs, locators):
-    """Pipeline genérico de transformações configuradas via JSON"""
-    transforms_map = locators["__config__"]["action_transforms_map"]
-
-    for sistema, df in dfs.items():
-        if df is None or df.empty:
-            continue
-
-        WebScrapping.log(f"🔧 Executando transformações para '{sistema}'", "INFO")
-        transformations = locators.get(sistema, {}).get("transformations", {}).get("type", {})
-
-        for transform_name, config in transformations.items():
-            func_name = transforms_map.get(transform_name)
-            if not func_name or not hasattr(TransformActions, func_name):
-                continue
-
-            func = getattr(TransformActions, func_name)
-            df = func(df, config)
-
-        # Subtransformações aninhadas, como modify_strings.configs
-        modify_cfgs = transformations.get("modify_strings", {}).get("configs", [])
-        for cfg in modify_cfgs:
-            for sub_name, sub_cfg in cfg.items():
-                func_name = transforms_map.get(sub_name)
-                if func_name and hasattr(TransformActions, func_name):
-                    func = getattr(TransformActions, func_name)
-                    df = func(df, sub_cfg)
-
-        dfs[sistema] = df
-    return dfs
-
+import re
 import pandas as pd
 import numpy as np
 
 class TransformActions:
+    # ... suas outras funções ...
 
     @staticmethod
-    def action_transform_conditional_new_column(df, config):
-        """Cria nova coluna baseada em uma condição sobre outra coluna"""
-        src_cfg = config.get("source_column", {})
-        column = src_cfg.get("column")
-        target_column = src_cfg.get("target_column")
-        cond = src_cfg.get("condition", {})
+    def action_transform_extract_ticket(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+        """
+        Extrai um valor (issue key) de uma coluna usando regex e escreve em target_column.
+        Config esperada:
+          - source_column: 'colname' ou {'column': 'colname'}
+          - target_column: nome da coluna destino (ex: 'Issue key')
+          - pattern: regex (ex: r"BRDADOS-(\d{4,})")
+          - first_group (opcional, default True): se True retorna o primeiro grupo captura; se False retorna o match inteiro
+        """
+        # normalizar nome da coluna fonte
+        src = config.get("source_column")
+        if isinstance(src, dict):
+            src_col = src.get("column")
+        else:
+            src_col = src
 
-        if column not in df.columns:
+        tgt_col = config.get("target_column") or config.get("target") or "Issue key"
+        pattern = config.get("pattern")
+        first_group = config.get("first_group", True)
+
+        if src_col is None:
+            # nada a fazer
             return df
 
-        case_insensitive = cond.get("case_insensitive", True)
-        contains_val = cond.get("contains", "")
-        val_true = cond.get("value_if_True", None)
-        val_false = cond.get("value_if_False", None)
-
-        mask = df[column].astype(str).str.contains(
-            contains_val, case=not case_insensitive, na=False
-        )
-
-        df[target_column] = np.where(mask, val_true, val_false)
-        return df
-
-
-    @staticmethod
-    def action_transform_replace_values(df, config):
-        """Substitui valores inteiros/exatos em colunas"""
-        src_cfg = config.get("source_column", {})
-        column = src_cfg.get("column")
-        replacements = src_cfg.get("replacements", {})
-
-        if column in df.columns:
-            df[column] = df[column].replace(replacements)
-        return df
-
-
-    @staticmethod
-    def action_transform_replace_strings(df, config):
-        """Substitui partes de strings em colunas"""
-        src_cfg = config.get("source_column", {})
-        column = src_cfg.get("column")
-        replacements = src_cfg.get("replacements", {})
-
-        if column not in df.columns:
+        if src_col not in df.columns:
+            # coluna não existe, cria coluna alvo com NaN e loga
+            df[tgt_col] = np.nan
+            # se tiver seu logger: WebScrapping.log(...)
             return df
 
-        df[column] = df[column].astype(str)
-        for old, new in replacements.items():
-            df[column] = df[column].str.replace(old, new, regex=False)
-        return df
+        if not pattern:
+            # sem pattern, cria coluna alvo vazia
+            df[tgt_col] = np.nan
+            return df
 
+        try:
+            # se há um grupo captura e first_group=True, extrair o grupo
+            # usar pandas.extract (vetorizado) — lida bem com NaNs
+            # detectar se pattern tem grupos
+            n_groups = re.compile(pattern).groups
+        except re.error:
+            # pattern inválido: fallback -> coluna vazia
+            df[tgt_col] = np.nan
+            return df
 
-    @staticmethod
-    def action_transform_uppercase(df, config):
-        """Transforma coluna em maiúsculas"""
-        column = config.get("target_column")
-        if column in df.columns:
-            df[column] = df[column].astype(str).str.upper()
-        return df
+        try:
+            if first_group and n_groups >= 1:
+                # extrai primeiro grupo — resultado será uma Series (primeira captura)
+                extracted = df[src_col].astype("string").str.extract(pattern, expand=True)
+                # se várias colunas (vários grupos), pegar a primeira
+                if isinstance(extracted, pd.DataFrame):
+                    # pega a primeira coluna do DataFrame de captura
+                    ser = extracted.iloc[:, 0].astype("string")
+                else:
+                    ser = extracted.astype("string")
+                # substituir strings vazias por NaN
+                ser = ser.replace("", pd.NA)
+                df[tgt_col] = ser.where(~ser.isna(), pd.NA)
+            else:
+                # se não há grupos ou first_group==False, extrair o match inteiro.
+                # pandas não dispõe diretamente de 'match inteiro' via extract sem grupo, então usamos re.search por linha
+                def find_full_match(val):
+                    if pd.isna(val):
+                        return pd.NA
+                    m = re.search(pattern, str(val))
+                    if not m:
+                        return pd.NA
+                    if first_group and m.groups():
+                        return m.group(1)
+                    else:
+                        return m.group(0)
+                df[tgt_col] = df[src_col].apply(find_full_match).astype("string")
+                df[tgt_col] = df[tgt_col].replace("", pd.NA)
 
+        except Exception:
+            # fallback seguro: coluna target vazia
+            df[tgt_col] = np.nan
 
-    @staticmethod
-    def action_transform_parse_dates(df, config):
-        """Converte colunas para datetime"""
-        columns = config.get("columns", [])
-        for col in columns:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
-        return df
-
-
-    @staticmethod
-    def action_transform_ignore_select_columns(df, config):
-        """Remove colunas desnecessárias ou nulas"""
-        cols = config.get("columns", [])
-        df = df.drop(columns=[c for c in cols if c in df.columns], errors="ignore")
         return df
