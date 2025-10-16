@@ -1,31 +1,34 @@
-        # ---------- NOVO: Pular Data de Inativação se status for ACTIV ----------
-        if "Data de Inativação" in descricao:
-            # 1) primeiro ver se já temos Status em resultados (rápido)
-            status_colab = resultados.get("Status")
-            if status_colab is not None:
-                # já veio via step anterior
-                if str(status_colab).strip().upper() == "ACTIV":
-                    WebScrapping.log("⏭️ Pulando passo 'Data de Inativação' (colaborador ativo - encontrado em resultados).", "INFO")
-                    continue
-            else:
-                # 2) se não está em resultados, tenta localizar o step 'Status' nos steps e ler direto do DOM com timeout curto
-                status_by = None
-                status_locator = None
-                for s in steps:
-                    if str(s.get("description") or "").strip().lower() == "status":
-                        status_by, status_locator = self.loader.parse_locator(s)
-                        break
+def action_get_text(self, by, locator, value=None, descricao=None, resultados=None, pin=None):
+    """
+    Captura texto de um elemento, considerando o estado do colaborador (CLOTURE ou ACTIF).
+    - Se o estado for 'CLOTURE', captura normalmente (a data estará visível).
+    - Se o estado for 'ACTIF', ignora o passo.
+    - Caso contrário, tenta capturar o texto como fallback genérico.
+    """
+    try:
+        elem = self.wait.until(EC.presence_of_element_located((by, locator)))
+        estado_elem = self.wait.until(EC.presence_of_element_located((By.ID, "etatPo")))
 
-                # tenta ler da página com WAIT curto (não bloqueante)
-                try:
-                    if status_by and status_locator:
-                        short_wait = WebDriverWait(self.loader.driver, 3)  # 3s curto
-                        status_elem = short_wait.until(EC.presence_of_element_located((status_by, status_locator)))
-                        status_text = (status_elem.text or "").strip().upper()
-                        if status_text == "ACTIV":
-                            WebScrapping.log("⏭️ Pulando passo 'Data de Inativação' (colaborador ativo - lido do DOM).", "INFO")
-                            continue
-                    # se não encontramos o elemento ou não é ACTIV, segue normalmente
-                except Exception:
-                    # Falha em localizar status rapidamente -> NÃO bloquear: executa o passo normal
-                    WebScrapping.log("⚠️ Não foi possível ler 'Status' rapidamente — executando 'Data de Inativação' normalmente.", "INFO")
+        estado = estado_elem.text.strip().upper()
+        texto_elem = elem.text.strip() if elem.text else ""
+
+        # 🔹 Caso 1: Estado = CLOTURE → captura data (ex: 15/09/2023)
+        if estado == "CLOTURE" and "/" in texto_elem:
+            if resultados is not None and descricao:
+                resultados[descricao] = texto_elem
+                self.log(f"✅ Capturado '{descricao}' (CLOTURE): {texto_elem}", "DEBUG")
+
+        # 🔹 Caso 2: Estado = ACTIF → pula passo
+        elif estado == "ACTIF":
+            self.log(f"⏭️ Pulando passo '{descricao}' (colaborador ativo)", "INFO")
+            return
+
+        # 🔹 Caso 3: Outro estado → tenta capturar se tiver conteúdo
+        else:
+            if resultados is not None and descricao:
+                resultados[descricao] = texto_elem
+                self.log(f"ℹ️ Capturado '{descricao}' (outro estado '{estado}'): {texto_elem}", "DEBUG")
+
+    except Exception as e:
+        self.log(f"⚠️ Erro ao capturar '{descricao}': {e}", "WARNING")
+        pass
