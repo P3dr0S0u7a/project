@@ -1,87 +1,31 @@
-import re
-import pandas as pd
-import numpy as np
-
-class TransformActions:
-    # ... suas outras funções ...
-
-    @staticmethod
-    def action_transform_extract_ticket(df: pd.DataFrame, config: dict) -> pd.DataFrame:
-        """
-        Extrai um valor (issue key) de uma coluna usando regex e escreve em target_column.
-        Config esperada:
-          - source_column: 'colname' ou {'column': 'colname'}
-          - target_column: nome da coluna destino (ex: 'Issue key')
-          - pattern: regex (ex: r"BRDADOS-(\d{4,})")
-          - first_group (opcional, default True): se True retorna o primeiro grupo captura; se False retorna o match inteiro
-        """
-        # normalizar nome da coluna fonte
-        src = config.get("source_column")
-        if isinstance(src, dict):
-            src_col = src.get("column")
-        else:
-            src_col = src
-
-        tgt_col = config.get("target_column") or config.get("target") or "Issue key"
-        pattern = config.get("pattern")
-        first_group = config.get("first_group", True)
-
-        if src_col is None:
-            # nada a fazer
-            return df
-
-        if src_col not in df.columns:
-            # coluna não existe, cria coluna alvo com NaN e loga
-            df[tgt_col] = np.nan
-            # se tiver seu logger: WebScrapping.log(...)
-            return df
-
-        if not pattern:
-            # sem pattern, cria coluna alvo vazia
-            df[tgt_col] = np.nan
-            return df
-
-        try:
-            # se há um grupo captura e first_group=True, extrair o grupo
-            # usar pandas.extract (vetorizado) — lida bem com NaNs
-            # detectar se pattern tem grupos
-            n_groups = re.compile(pattern).groups
-        except re.error:
-            # pattern inválido: fallback -> coluna vazia
-            df[tgt_col] = np.nan
-            return df
-
-        try:
-            if first_group and n_groups >= 1:
-                # extrai primeiro grupo — resultado será uma Series (primeira captura)
-                extracted = df[src_col].astype("string").str.extract(pattern, expand=True)
-                # se várias colunas (vários grupos), pegar a primeira
-                if isinstance(extracted, pd.DataFrame):
-                    # pega a primeira coluna do DataFrame de captura
-                    ser = extracted.iloc[:, 0].astype("string")
-                else:
-                    ser = extracted.astype("string")
-                # substituir strings vazias por NaN
-                ser = ser.replace("", pd.NA)
-                df[tgt_col] = ser.where(~ser.isna(), pd.NA)
+        # ---------- NOVO: Pular Data de Inativação se status for ACTIV ----------
+        if "Data de Inativação" in descricao:
+            # 1) primeiro ver se já temos Status em resultados (rápido)
+            status_colab = resultados.get("Status")
+            if status_colab is not None:
+                # já veio via step anterior
+                if str(status_colab).strip().upper() == "ACTIV":
+                    WebScrapping.log("⏭️ Pulando passo 'Data de Inativação' (colaborador ativo - encontrado em resultados).", "INFO")
+                    continue
             else:
-                # se não há grupos ou first_group==False, extrair o match inteiro.
-                # pandas não dispõe diretamente de 'match inteiro' via extract sem grupo, então usamos re.search por linha
-                def find_full_match(val):
-                    if pd.isna(val):
-                        return pd.NA
-                    m = re.search(pattern, str(val))
-                    if not m:
-                        return pd.NA
-                    if first_group and m.groups():
-                        return m.group(1)
-                    else:
-                        return m.group(0)
-                df[tgt_col] = df[src_col].apply(find_full_match).astype("string")
-                df[tgt_col] = df[tgt_col].replace("", pd.NA)
+                # 2) se não está em resultados, tenta localizar o step 'Status' nos steps e ler direto do DOM com timeout curto
+                status_by = None
+                status_locator = None
+                for s in steps:
+                    if str(s.get("description") or "").strip().lower() == "status":
+                        status_by, status_locator = self.loader.parse_locator(s)
+                        break
 
-        except Exception:
-            # fallback seguro: coluna target vazia
-            df[tgt_col] = np.nan
-
-        return df
+                # tenta ler da página com WAIT curto (não bloqueante)
+                try:
+                    if status_by and status_locator:
+                        short_wait = WebDriverWait(self.loader.driver, 3)  # 3s curto
+                        status_elem = short_wait.until(EC.presence_of_element_located((status_by, status_locator)))
+                        status_text = (status_elem.text or "").strip().upper()
+                        if status_text == "ACTIV":
+                            WebScrapping.log("⏭️ Pulando passo 'Data de Inativação' (colaborador ativo - lido do DOM).", "INFO")
+                            continue
+                    # se não encontramos o elemento ou não é ACTIV, segue normalmente
+                except Exception:
+                    # Falha em localizar status rapidamente -> NÃO bloquear: executa o passo normal
+                    WebScrapping.log("⚠️ Não foi possível ler 'Status' rapidamente — executando 'Data de Inativação' normalmente.", "INFO")
