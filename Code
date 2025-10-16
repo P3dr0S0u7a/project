@@ -1,34 +1,33 @@
 def action_get_text(self, by, locator, value=None, descricao=None, resultados=None, pin=None):
     """
-    Captura texto de um elemento, considerando o estado do colaborador (CLOTURE ou ACTIF).
-    - Se o estado for 'CLOTURE', captura normalmente (a data estará visível).
-    - Se o estado for 'ACTIF', ignora o passo.
-    - Caso contrário, tenta capturar o texto como fallback genérico.
+    Função genérica para capturar texto de um elemento na página.
+    - Serve para qualquer site (Jira, ServiceNow, Spirit, etc).
+    - Se o elemento existir, captura o texto.
+    - Se não existir ou estiver vazio, ignora silenciosamente.
+    - Adapta-se automaticamente a casos em que existe um elemento de status (ex: 'etatPo'),
+      onde só deve capturar valores se o status for 'CLOTURE'.
     """
     try:
         elem = self.wait.until(EC.presence_of_element_located((by, locator)))
-        estado_elem = self.wait.until(EC.presence_of_element_located((By.ID, "etatPo")))
-
-        estado = estado_elem.text.strip().upper()
         texto_elem = elem.text.strip() if elem.text else ""
 
-        # 🔹 Caso 1: Estado = CLOTURE → captura data (ex: 15/09/2023)
-        if estado == "CLOTURE" and "/" in texto_elem:
-            if resultados is not None and descricao:
-                resultados[descricao] = texto_elem
-                self.log(f"✅ Capturado '{descricao}' (CLOTURE): {texto_elem}", "DEBUG")
+        # Tentativa de detectar o elemento de status (sem depender do JSON)
+        try:
+            status_elem = self.driver.find_element(By.ID, "etatPo")
+            status_text = status_elem.text.strip().upper()
+        except Exception:
+            status_text = None  # Pode não existir, e tudo bem
 
-        # 🔹 Caso 2: Estado = ACTIF → pula passo
-        elif estado == "ACTIF":
-            self.log(f"⏭️ Pulando passo '{descricao}' (colaborador ativo)", "INFO")
+        # Regra adaptativa: se o status for ACTIF, ignora campos de data/desligamento
+        if status_text == "ACTIF" and "/" in texto_elem:
+            self.log(f"⏭️ Pulando '{descricao}' (colaborador ativo, data ignorada)", "INFO")
             return
 
-        # 🔹 Caso 3: Outro estado → tenta capturar se tiver conteúdo
-        else:
-            if resultados is not None and descricao:
-                resultados[descricao] = texto_elem
-                self.log(f"ℹ️ Capturado '{descricao}' (outro estado '{estado}'): {texto_elem}", "DEBUG")
+        # Caso status seja CLOTURE, ou se o campo for genérico (sem status), captura normalmente
+        if resultados is not None and descricao:
+            resultados[descricao] = texto_elem
+            self.log(f"✅ Capturado '{descricao}': {texto_elem}", "DEBUG")
 
     except Exception as e:
-        self.log(f"⚠️ Erro ao capturar '{descricao}': {e}", "WARNING")
+        self.log(f"⚠️ Não foi possível capturar '{descricao}': {e}", "INFO")
         pass
