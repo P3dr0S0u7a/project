@@ -1,33 +1,39 @@
-def action_get_text(self, by, locator, value=None, descricao=None, resultados=None, pin=None):
-    """
-    Função genérica para capturar texto de um elemento na página.
-    - Serve para qualquer site (Jira, ServiceNow, Spirit, etc).
-    - Se o elemento existir, captura o texto.
-    - Se não existir ou estiver vazio, ignora silenciosamente.
-    - Adapta-se automaticamente a casos em que existe um elemento de status (ex: 'etatPo'),
-      onde só deve capturar valores se o status for 'CLOTURE'.
-    """
-    try:
-        elem = self.wait.until(EC.presence_of_element_located((by, locator)))
-        texto_elem = elem.text.strip() if elem.text else ""
+@staticmethod
+def action_transform_conditional_new_column(df, config):
+    """Cria uma ou mais novas colunas baseadas em condições sobre outras colunas"""
 
-        # Tentativa de detectar o elemento de status (sem depender do JSON)
+    # Caso venha uma lista de condições, percorre todas
+    configs = config if isinstance(config, list) else [config]
+
+    for cfg in configs:
+        src_cfg = cfg.get("source_column", {})
+        column = src_cfg.get("column")
+        target_column = src_cfg.get("target_column")
+        cond = src_cfg.get("condition", {})
+
+        if not column or column not in df.columns:
+            WebScrapping.log(f"⚠️ Coluna '{column}' não encontrada no DataFrame.", "WARNING")
+            continue
+
+        case_insensitive = cond.get("case_insensitive", True)
+        contains_val = cond.get("contains", "")
+        val_true = cond.get("value_if_True", None)
+        val_false = cond.get("value_if_False", None)
+
+        df[column] = df[column].astype(str).replace({"nan": "", "NaN": "", "<NA>": "", None: ""})
+
         try:
-            status_elem = self.driver.find_element(By.ID, "etatPo")
-            status_text = status_elem.text.strip().upper()
-        except Exception:
-            status_text = None  # Pode não existir, e tudo bem
+            mask = (
+                df[column].str.lower().str.contains(str(contains_val).lower(), na=True)
+                if case_insensitive
+                else df[column].str.contains(str(contains_val), na=True)
+            )
+            df[target_column] = np.where(mask, val_true, val_false)
+            WebScrapping.log(
+                f"✅ Condicional '{contains_val}' aplicada na coluna '{column}' → '{target_column}'",
+                "INFO"
+            )
+        except Exception as e:
+            WebScrapping.log(f"❌ Erro em action_transform_conditional_new_column: {e}", "ERROR")
 
-        # Regra adaptativa: se o status for ACTIF, ignora campos de data/desligamento
-        if status_text == "ACTIF" and "/" in texto_elem:
-            self.log(f"⏭️ Pulando '{descricao}' (colaborador ativo, data ignorada)", "INFO")
-            return
-
-        # Caso status seja CLOTURE, ou se o campo for genérico (sem status), captura normalmente
-        if resultados is not None and descricao:
-            resultados[descricao] = texto_elem
-            self.log(f"✅ Capturado '{descricao}': {texto_elem}", "DEBUG")
-
-    except Exception as e:
-        self.log(f"⚠️ Não foi possível capturar '{descricao}': {e}", "INFO")
-        pass
+    return df
