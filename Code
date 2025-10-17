@@ -1,39 +1,43 @@
-@staticmethod
-def action_transform_conditional_new_column(df, config):
-    """Cria uma ou mais novas colunas baseadas em condições sobre outras colunas"""
+def pipeline_transformacao(dfs, locators):
+    """Pipeline genérico de transformações configuradas via JSON"""
+    transforms_map = locators.get("__config__", {}).get("action_transforms_map", {})
 
-    # Caso venha uma lista de condições, percorre todas
-    configs = config if isinstance(config, list) else [config]
-
-    for cfg in configs:
-        src_cfg = cfg.get("source_column", {})
-        column = src_cfg.get("column")
-        target_column = src_cfg.get("target_column")
-        cond = src_cfg.get("condition", {})
-
-        if not column or column not in df.columns:
-            WebScrapping.log(f"⚠️ Coluna '{column}' não encontrada no DataFrame.", "WARNING")
+    for sistema, df in dfs.items():
+        if df is None or df.empty:
             continue
 
-        case_insensitive = cond.get("case_insensitive", True)
-        contains_val = cond.get("contains", "")
-        val_true = cond.get("value_if_True", None)
-        val_false = cond.get("value_if_False", None)
+        WebScrapping.log(f"🔧 Executando transformações para '{sistema}'", "INFO")
 
-        df[column] = df[column].astype(str).replace({"nan": "", "NaN": "", "<NA>": "", None: ""})
+        transformations = locators.get(sistema, {}).get("transformations", {})
 
-        try:
-            mask = (
-                df[column].str.lower().str.contains(str(contains_val).lower(), na=True)
-                if case_insensitive
-                else df[column].str.contains(str(contains_val), na=True)
-            )
-            df[target_column] = np.where(mask, val_true, val_false)
-            WebScrapping.log(
-                f"✅ Condicional '{contains_val}' aplicada na coluna '{column}' → '{target_column}'",
-                "INFO"
-            )
-        except Exception as e:
-            WebScrapping.log(f"❌ Erro em action_transform_conditional_new_column: {e}", "ERROR")
+        # 🔹 1ª camada — transformações diretas
+        for transform_name, config in transformations.items():
+            if transform_name == "modify_strings":
+                continue  # tratado abaixo
 
-    return df
+            func_name = transforms_map.get(transform_name)
+            if not func_name or not hasattr(TransformActions, func_name):
+                continue
+
+            func = getattr(TransformActions, func_name)
+
+            # 🔸 Caso a configuração seja uma lista, aplica para cada item
+            configs = config if isinstance(config, list) else [config]
+            for cfg in configs:
+                WebScrapping.log(f"➡️ Aplicando transformação '{transform_name}'", "INFO")
+                df = func(df, cfg)
+
+        # 🔹 2ª camada — transformações aninhadas dentro de modify_strings/configs[]
+        modify_cfgs = transformations.get("modify_strings", {}).get("configs", [])
+        for cfg in modify_cfgs:
+            for sub_name, sub_cfg in cfg.items():
+                func_name = transforms_map.get(sub_name)
+                if func_name and hasattr(TransformActions, func_name):
+                    func = getattr(TransformActions, func_name)
+                    WebScrapping.log(f"➡️ Aplicando transformação '{sub_name}'", "INFO")
+                    df = func(df, sub_cfg)
+
+        dfs[sistema] = df
+        WebScrapping.log(f"✅ Transformações concluídas para '{sistema}'", "INFO")
+
+    return dfs
