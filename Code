@@ -1,31 +1,96 @@
-@staticmethod
-def action_transform_parse_dates(df, config):
-    """Converte colunas para datetime, com tolerância a múltiplos formatos"""
-    columns = config.get("columns", [])
-    columns = [columns] if isinstance(columns, str) else columns
+import os
+import re
+import subprocess
+import warnings
+from pathlib import Path
+from dotenv import load_dotenv
+from classes.WebScrapping import WebScrapping  # ajuste o import conforme seu projeto
 
-    def parse_datas(x):
-        """Transforma strings em datas, aceitando diferentes formatos"""
-        if pd.isnull(x):
-            return x
+# ==========================================================
+# 🔧 Configuração inicial (segue seu padrão)
+# ==========================================================
+load_dotenv(Path.cwd().parent.parent.parent / "Env" / ".env")
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+
+class EdgeVersionChecker:
+    """
+    Verifica compatibilidade entre:
+    - Versão do Microsoft Edge instalada
+    - Versão do EdgeDriver configurada no .env
+    """
+
+    def __init__(self):
+        self.edge_driver_path = os.getenv("EDGEDRIVER-PATH")
+
+    # ==========================================================
+    # 🧩 Métodos principais
+    # ==========================================================
+    def versao_navegador_edge_instalada(self):
+        """Obtém a versão do Microsoft Edge instalada."""
         try:
-            return pd.to_datetime(x, format="%d/%m/%Y %H:%M:%S", dayfirst=True, errors="coerce")
+            out = subprocess.check_output(
+                r'reg query "HKEY_CURRENT_USER\Software\Microsoft\Edge\BLBeacon" /v version',
+                shell=True, text=True
+            )
+            return re.search(r"(\d+\.\d+\.\d+\.\d+)", out).group(1)
         except Exception:
-            try:
-                return pd.to_datetime(x, dayfirst=True, errors="coerce")
-            except Exception:
-                return x
+            # Tentativa alternativa via CLI
+            out = subprocess.check_output("msedge --version", shell=True, text=True)
+            return re.search(r"(\d+\.\d+\.\d+\.\d+)", out).group(1)
 
-    for col in columns:
-        if col not in df.columns:
-            WebScrapping.log(f"⚠️ Coluna '{col}' não encontrada no DataFrame.", "WARNING")
-            continue
+    def versao_edge_driver_download(self):
+        """Obtém a versão contida no caminho configurado no .env."""
+        if not self.edge_driver_path:
+            raise ValueError("❌ A variável 'EDGEDRIVER-PATH' não foi configurada no .env")
 
+        match = re.search(r"(\d+\.\d+\.\d+\.\d+)", self.edge_driver_path)
+        if not match:
+            raise ValueError(f"❌ Caminho inválido no EDGEDRIVER-PATH: {self.edge_driver_path}")
+        return match.group(1)
+
+    def verificar_compatibilidade(self):
+        """Compara versões e gera logs via WebScrapping.log."""
         try:
-            # Aplica o parser linha a linha com tolerância a erros
-            df[col] = df[col].apply(parse_datas)
-            WebScrapping.log(f"📅 Coluna '{col}' convertida para datetime", "INFO")
-        except Exception as e:
-            WebScrapping.log(f"❌ Erro ao converter coluna '{col}' para datetime: {e}", "ERROR")
+            navegador = self.versao_navegador_edge_instalada()
+            driver = self.versao_edge_driver_download()
+            url_download = f"https://msedgedriver.microsoft.com/{driver}/edgedriver_win64.zip"
 
-    return df
+            if navegador != driver:
+                WebScrapping.log(
+                    f"⚠️ [Edge-Navegador-VS-EdgeDriver]: Versão do navegador {navegador} diferente do msedgedriver.exe {driver}, instalada em: {self.edge_driver_path}",
+                    "CRITICAL"
+                )
+                WebScrapping.log(
+                    f"📥 [Atenção]: Faça o download da versão compatível: {url_download}",
+                    "CRITICAL"
+                )
+                return {
+                    "status": "incompatível",
+                    "navegador": navegador,
+                    "driver": driver,
+                    "download_url": url_download
+                }
+
+            WebScrapping.log(
+                f"✅ [EdgeDriver OK]: Navegador e driver estão na mesma versão ({navegador}).",
+                "INFO"
+            )
+            return {
+                "status": "compatível",
+                "versao": navegador,
+                "download_url": url_download
+            }
+
+        except Exception as e:
+            WebScrapping.log(f"❌ Erro ao verificar compatibilidade do EdgeDriver: {e}", "ERROR")
+            return {"status": "erro", "mensagem": str(e)}
+
+
+# ==========================================================
+# 🚀 Execução direta (opcional)
+# ==========================================================
+if __name__ == "__main__":
+    checker = EdgeVersionChecker()
+    resultado = checker.verificar_compatibilidade()
+    print(resultado)
