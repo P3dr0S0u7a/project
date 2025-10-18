@@ -1,29 +1,31 @@
-import subprocess, re
+@staticmethod
+def action_transform_parse_dates(df, config):
+    """Converte colunas para datetime, com tolerância a múltiplos formatos"""
+    columns = config.get("columns", [])
+    columns = [columns] if isinstance(columns, str) else columns
 
-def versao_edge_instalada():
-    try:
-        # Tenta pegar pelo registro
-        out = subprocess.check_output(
-            r'reg query "HKEY_CURRENT_USER\Software\Microsoft\Edge\BLBeacon" /v version',
-            shell=True, text=True
-        )
-        return re.search(r"(\d+\.\d+\.\d+\.\d+)", out).group(1)
-    except:
-        # fallback: usar comando do edge
-        out = subprocess.check_output("msedge --version", shell=True, text=True)
-        return re.search(r"(\d+\.\d+\.\d+\.\d+)", out).group(1)
+    def parse_datas(x):
+        """Transforma strings em datas, aceitando diferentes formatos"""
+        if pd.isnull(x):
+            return x
+        try:
+            return pd.to_datetime(x, format="%d/%m/%Y %H:%M:%S", dayfirst=True, errors="coerce")
+        except Exception:
+            try:
+                return pd.to_datetime(x, dayfirst=True, errors="coerce")
+            except Exception:
+                return x
 
-import requests, zipfile, io, pathlib
+    for col in columns:
+        if col not in df.columns:
+            WebScrapping.log(f"⚠️ Coluna '{col}' não encontrada no DataFrame.", "WARNING")
+            continue
 
-versao = versao_edge_instalada()
-major = versao.split(".")[0]
-url_version = f"https://msedgedriver.azureedge.net/LATEST_RELEASE_{major}"
-versao_driver = requests.get(url_version).text.strip()
+        try:
+            # Aplica o parser linha a linha com tolerância a erros
+            df[col] = df[col].apply(parse_datas)
+            WebScrapping.log(f"📅 Coluna '{col}' convertida para datetime", "INFO")
+        except Exception as e:
+            WebScrapping.log(f"❌ Erro ao converter coluna '{col}' para datetime: {e}", "ERROR")
 
-zip_url = f"https://msedgedriver.azureedge.net/{versao_driver}/edgedriver_win64.zip"
-r = requests.get(zip_url)
-zf = zipfile.ZipFile(io.BytesIO(r.content))
-destino = pathlib.Path("drivers/edgedriver")
-destino.mkdir(parents=True, exist_ok=True)
-zf.extractall(destino)
-print("Driver baixado e extraído em:", destino)
+    return df
