@@ -1,80 +1,99 @@
-def extract_method(self, ids: list = None, pin: str = None):
-    if not ids:
-        WebScrapping.log("⚠️ Lista de IDs vazia recebida", "WARNING")
-        return pd.DataFrame(), pd.DataFrame()
+from cryptography.fernet import Fernet
+from io import StringIO
 
-    # 🔧 Preparações iniciais
-    ids_validos = list(dict.fromkeys([str(i).strip() for i in ids if i and str(i).strip()]))
-    users_locators = self.locators_global.get("users", {}).get("steps", [])
-    depto_locators = self.locators_global.get("depto", {}).get("steps", [])
-    resultados_users, resultados_deptos = [], []
-    usuarios_processados, deptos_processados = set(), set()
+class SecureEnvManager:
+    """
+    Classe genérica para gerenciar criptografia e carregamento de arquivos .env
+    de forma automática e segura.
+    """
 
-    # ===================================================================
-    # 🧩 FUNÇÕES INTERNAS
-    # ===================================================================
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.env_file = config_path / ".env"
+        self.enc_file = config_path / ".env.enc"
+        self.key_file = config_path / "secret.key"
 
-    def processar_users(lista_ids, usuarios_existentes):
-        """Executa o fluxo de extração de USERS."""
-        resultados = []
-        for uid in lista_ids:
-            resultado_user = self.executar_passos(parametro=uid, steps=users_locators, pin=pin)
-            if resultado_user and resultado_user.get("E-mail") not in usuarios_existentes:
-                resultados.append(pd.DataFrame([resultado_user]))
-                usuarios_existentes.add(resultado_user.get("E-mail"))
-        return resultados, usuarios_existentes
+        logging.basicConfig(
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            level=logging.INFO,
+        )
 
-    def processar_deptos(lista_deptos):
-        """Executa o fluxo de extração de DEPTO e coleta UID dos responsáveis."""
-        resultados = []
-        novos_responsaveis = set()
+    def _generate_key(self):
+        """Gera e salva a chave de criptografia."""
+        key = Fernet.generate_key()
+        self.key_file.write_bytes(key)
+        logging.info(f"🔐 Chave gerada e salva em: {self.key_file}")
+        return key
 
-        for depto_id in lista_deptos:
-            resultado_depto = self.executar_passos(parametro=depto_id, steps=depto_locators, pin=pin)
-            if resultado_depto:
-                resultados.append(pd.DataFrame([resultado_depto]))
-                uid_resp = resultado_depto.get("UID Responsável")
-                if uid_resp:
-                    novos_responsaveis.add(str(uid_resp).strip())
-        return resultados, novos_responsaveis
+    def _load_key(self):
+        """Lê a chave existente do arquivo."""
+        if not self.key_file.exists():
+            logging.warning("⚠️ Nenhuma chave encontrada. Gerando nova...")
+            return self._generate_key()
+        return self.key_file.read_bytes()
 
-    # ===================================================================
-    # 🧭 FASE 1: USERS (originais)
-    # ===================================================================
-    resultados_f1, usuarios_processados = processar_users(ids_validos, usuarios_processados)
-    resultados_users.extend(resultados_f1)
+    def encrypt_env(self):
+        """Criptografa o arquivo .env original."""
+        if not self.env_file.exists():
+            logging.error("❌ Arquivo .env não encontrado para criptografar.")
+            return False
 
-    # ===================================================================
-    # 🧭 FASE 2: DEPTO
-    # ===================================================================
-    deptos_a_processar = list(dict.fromkeys(
-        str(u.get("parametro", "")).strip()
-        for df_user in resultados_users
-        for u in df_user.to_dict("records")
-        if u.get("parametro")
-    ))
+        key = self._load_key()
+        fernet = Fernet(key)
 
-    resultados_f2, novos_responsaveis = processar_deptos(deptos_a_processar)
-    resultados_deptos.extend(resultados_f2)
+        env_data = self.env_file.read_bytes()
+        encrypted_data = fernet.encrypt(env_data)
+        self.enc_file.write_bytes(encrypted_data)
 
-    # ===================================================================
-    # 🧭 FASE 3: USERS (responsáveis)
-    # ===================================================================
-    novos_responsaveis -= usuarios_processados
-    if novos_responsaveis:
-        WebScrapping.log(f"👤 {len(novos_responsaveis)} novos responsáveis detectados", "INFO")
-        resultados_f3, usuarios_processados = processar_users(novos_responsaveis, usuarios_processados)
-        resultados_users.extend(resultados_f3)
+        logging.info(f"✅ Arquivo .env criptografado em: {self.enc_file}")
 
-    # ===================================================================
-    # 📊 Consolidação final
-    # ===================================================================
-    df_users_final = pd.concat(resultados_users, ignore_index=True) if resultados_users else pd.DataFrame()
-    df_deptos_final = pd.concat(resultados_deptos, ignore_index=True) if resultados_deptos else pd.DataFrame()
+        # Opcional: apagar o original
+        # self.env_file.unlink()
+        return True
 
-    WebScrapping.log(
-        f"✅ Concluído: {len(df_users_final)} usuários (incluindo responsáveis), "
-        f"{len(df_deptos_final)} departamentos",
-        "INFO"
-    )
-    return df_users_final, df_deptos_final
+    def decrypt_env(self):
+        """Descriptografa e carrega as variáveis de ambiente."""
+        if not self.enc_file.exists():
+            logging.error("❌ Nenhum arquivo .env.enc encontrado.")
+            return False
+
+        key = self._load_key()
+        fernet = Fernet(key)
+        decrypted_data = fernet.decrypt(self.enc_file.read_bytes()).decode()
+
+        load_dotenv(stream=StringIO(decrypted_data))
+        logging.info("✅ Variáveis de ambiente carregadas com sucesso!")
+        return True
+
+    def auto_manage(self):
+        """
+        Faz o controle automático:
+        - Se existir apenas .env → criptografa
+        - Se existir .env.enc → descriptografa e carrega
+        """
+        if self.env_file.exists() and not self.enc_file.exists():
+            logging.info("📦 Detectado .env puro — iniciando criptografia...")
+            self.encrypt_env()
+            logging.info("✅ Criptografia concluída. Carregando variáveis...")
+            self.decrypt_env()
+
+        elif self.enc_file.exists():
+            logging.info("🔐 Detectado .env criptografado — carregando variáveis...")
+            self.decrypt_env()
+
+        else:
+            logging.error("❌ Nenhum arquivo de ambiente encontrado (.env ou .env.enc).")
+
+
+# Execução direta (caso queira rodar standalone)
+if __name__ == "__main__":
+    manager = SecureEnvManager(Path(__file__).parent)
+    manager.auto_manage()
+
+from config.secure_env_manager import SecureEnvManager
+
+# Inicializa e carrega o ambiente
+config_dir = Path.cwd().parent.parent / "config"
+manager = SecureEnvManager(config_dir)
+manager.auto_manage()
+
