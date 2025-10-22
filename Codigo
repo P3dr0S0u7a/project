@@ -1,0 +1,80 @@
+def extract_method(self, ids: list = None, pin: str = None):
+    if not ids:
+        WebScrapping.log("⚠️ Lista de IDs vazia recebida", "WARNING")
+        return pd.DataFrame(), pd.DataFrame()
+
+    # 🔧 Preparações iniciais
+    ids_validos = list(dict.fromkeys([str(i).strip() for i in ids if i and str(i).strip()]))
+    users_locators = self.locators_global.get("users", {}).get("steps", [])
+    depto_locators = self.locators_global.get("depto", {}).get("steps", [])
+    resultados_users, resultados_deptos = [], []
+    usuarios_processados, deptos_processados = set(), set()
+
+    # ===================================================================
+    # 🧩 FUNÇÕES INTERNAS
+    # ===================================================================
+
+    def processar_users(lista_ids, usuarios_existentes):
+        """Executa o fluxo de extração de USERS."""
+        resultados = []
+        for uid in lista_ids:
+            resultado_user = self.executar_passos(parametro=uid, steps=users_locators, pin=pin)
+            if resultado_user and resultado_user.get("E-mail") not in usuarios_existentes:
+                resultados.append(pd.DataFrame([resultado_user]))
+                usuarios_existentes.add(resultado_user.get("E-mail"))
+        return resultados, usuarios_existentes
+
+    def processar_deptos(lista_deptos):
+        """Executa o fluxo de extração de DEPTO e coleta UID dos responsáveis."""
+        resultados = []
+        novos_responsaveis = set()
+
+        for depto_id in lista_deptos:
+            resultado_depto = self.executar_passos(parametro=depto_id, steps=depto_locators, pin=pin)
+            if resultado_depto:
+                resultados.append(pd.DataFrame([resultado_depto]))
+                uid_resp = resultado_depto.get("UID Responsável")
+                if uid_resp:
+                    novos_responsaveis.add(str(uid_resp).strip())
+        return resultados, novos_responsaveis
+
+    # ===================================================================
+    # 🧭 FASE 1: USERS (originais)
+    # ===================================================================
+    resultados_f1, usuarios_processados = processar_users(ids_validos, usuarios_processados)
+    resultados_users.extend(resultados_f1)
+
+    # ===================================================================
+    # 🧭 FASE 2: DEPTO
+    # ===================================================================
+    deptos_a_processar = list(dict.fromkeys(
+        str(u.get("parametro", "")).strip()
+        for df_user in resultados_users
+        for u in df_user.to_dict("records")
+        if u.get("parametro")
+    ))
+
+    resultados_f2, novos_responsaveis = processar_deptos(deptos_a_processar)
+    resultados_deptos.extend(resultados_f2)
+
+    # ===================================================================
+    # 🧭 FASE 3: USERS (responsáveis)
+    # ===================================================================
+    novos_responsaveis -= usuarios_processados
+    if novos_responsaveis:
+        WebScrapping.log(f"👤 {len(novos_responsaveis)} novos responsáveis detectados", "INFO")
+        resultados_f3, usuarios_processados = processar_users(novos_responsaveis, usuarios_processados)
+        resultados_users.extend(resultados_f3)
+
+    # ===================================================================
+    # 📊 Consolidação final
+    # ===================================================================
+    df_users_final = pd.concat(resultados_users, ignore_index=True) if resultados_users else pd.DataFrame()
+    df_deptos_final = pd.concat(resultados_deptos, ignore_index=True) if resultados_deptos else pd.DataFrame()
+
+    WebScrapping.log(
+        f"✅ Concluído: {len(df_users_final)} usuários (incluindo responsáveis), "
+        f"{len(df_deptos_final)} departamentos",
+        "INFO"
+    )
+    return df_users_final, df_deptos_final
