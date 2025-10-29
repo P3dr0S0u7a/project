@@ -1,99 +1,146 @@
-from cryptography.fernet import Fernet
-from io import StringIO
-
-class SecureEnvManager:
+def extract_method(self, ids: List[str] = None, pin: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Classe genérica para gerenciar criptografia e carregamento de arquivos .env
-    de forma automática e segura.
+    Executa o pipeline de extração de usuários e departamentos de forma totalmente dinâmica,
+    com base nos locators configurados no JSON (sem hardcodes).
     """
+    resultados_users = []
+    resultados_deptos = []
+    deptos_processados = set()
+    deptos_a_processar = []
+    usuarios_processados = set()
+    usuarios_a_processar = set()
 
-    def __init__(self, config_path: Path):
-        self.config_path = config_path
-        self.env_file = config_path / ".env"
-        self.enc_file = config_path / ".env.enc"
-        self.key_file = config_path / "secret.key"
+    WebScrapping.log(f" 🆔 Iniciando extração com {len(ids) if ids else 0} IDs de origem.", "INFO")
 
-        logging.basicConfig(
-            format="%(asctime)s [%(levelname)s] %(message)s",
-            level=logging.INFO,
+    if not ids:
+        WebScrapping.log(" ⚠️ Lista de IDs vazia recebida", "WARNING")
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Remove duplicados e espaços
+    ids_validos = list(dict.fromkeys([str(id_).strip() for id_ in ids if id_ and str(id_).strip()]))
+
+    # Carrega steps do JSON
+    users_locators = self.locators_global.get("users", {}).get("steps", [])
+    depto_locators = self.locators_global.get("depto", {}).get("steps", [])
+
+    # ==============================
+    # 🔹 1️⃣ PROCESSAMENTO DE USUÁRIOS
+    # ==============================
+    for idx, uid_origem in enumerate(ids_validos):
+        uid = uid_origem
+        WebScrapping.log(f" 🔍 {idx + 1}/{len(ids_validos)} - Processando usuário UID: {uid}", "INFO")
+
+        try:
+            resultado_user = self.executar_passos(parametro=uid, steps=users_locators, pin=pin)
+        except Exception as e:
+            WebScrapping.log(f" ❌ Erro ao processar UID {uid}: {str(e)}", "ERROR")
+            continue
+
+        # Extração dinâmica de e-mail e departamento
+        email = resultado_user.get("E-mail")
+        depto_id = resultado_user.get("parametro")
+
+        if not email:
+            WebScrapping.log(f" ⚠️ Usuário {uid} sem E-mail. Ignorado.", "WARNING")
+            continue
+
+        # Evita reprocessamento
+        if email in usuarios_processados:
+            continue
+
+        # Substitui o parâmetro atual (UID) pelo e-mail
+        resultado_user["parametro"] = email.strip()
+
+        # Monta o DataFrame de usuário
+        df_user = pd.DataFrame([resultado_user]).copy()
+        df_user["UID.1"] = uid
+        df_user["UID Setor"] = depto_id
+        resultados_users.append(df_user)
+
+        usuarios_processados.add(email)
+        WebScrapping.log(f" ✅ Usuário {uid} ({email}) processado com sucesso.", "INFO")
+
+        if depto_id and depto_id not in deptos_a_processar:
+            deptos_a_processar.append(depto_id)
+
+    # ==============================
+    # 🔹 2️⃣ PROCESSAMENTO DE DEPARTAMENTOS
+    # ==============================
+    deptos_a_processar = list(dict.fromkeys([d for d in deptos_a_processar if d]))
+
+    for idx, depto_id in enumerate(deptos_a_processar):
+        WebScrapping.log(f" 🏢 {idx + 1}/{len(deptos_a_processar)} - Processando setor: {depto_id}", "INFO")
+
+        try:
+            resultado_depto = self.executar_passos(parametro=depto_id, steps=depto_locators, pin=pin)
+        except Exception as e:
+            WebScrapping.log(f" ❌ Erro ao processar setor '{depto_id}': {str(e)}", "ERROR")
+            continue
+
+        if not resultado_depto:
+            WebScrapping.log(f" ⚠️ Setor {depto_id} retornou vazio.", "WARNING")
+            continue
+
+        uid_responsavel = resultado_depto.get("UID Responsável")
+        if not uid_responsavel:
+            WebScrapping.log(f" ⚠️ Setor {depto_id} sem responsável definido.", "WARNING")
+
+        # Monta DataFrame do setor
+        df_depto = pd.DataFrame([resultado_depto]).copy()
+        df_depto["Id Setor.1"] = depto_id
+        resultados_deptos.append(df_depto)
+        deptos_processados.add(depto_id)
+
+        WebScrapping.log(f" ✅ Setor {resultado_depto.get('Setor', '(sem nome)')} processado com sucesso.", "INFO")
+
+        # Adiciona responsável para reprocessar
+        if uid_responsavel and uid_responsavel not in usuarios_a_processar:
+            usuarios_a_processar.add(uid_responsavel)
+
+    # ==============================
+    # 🔹 3️⃣ PROCESSAMENTO DOS RESPONSÁVEIS
+    # ==============================
+    novos_ids_validos = list(dict.fromkeys([u for u in usuarios_a_processar if u]))
+
+    for idx, uid_resp in enumerate(novos_ids_validos):
+        WebScrapping.log(f" 👤 {idx + 1}/{len(novos_ids_validos)} - Processando responsável UID: {uid_resp}", "INFO")
+
+        try:
+            resultado_user = self.executar_passos(parametro=uid_resp, steps=users_locators, pin=pin)
+        except Exception as e:
+            WebScrapping.log(f" ❌ Erro ao processar responsável '{uid_resp}': {str(e)}", "ERROR")
+            continue
+
+        email = resultado_user.get("E-mail")
+        if not email:
+            continue
+
+        if email in usuarios_processados:
+            continue
+
+        depto_id = resultado_user.get("parametro")
+        resultado_user["parametro"] = email.strip()
+
+        df_user = pd.DataFrame([resultado_user]).copy()
+        df_user["UID.1"] = uid_resp
+        df_user["UID Setor"] = depto_id
+        resultados_users.append(df_user)
+        usuarios_processados.add(email)
+
+        WebScrapping.log(f" ✅ Responsável {uid_resp} ({email}) processado com sucesso.", "INFO")
+
+    # ==============================
+    # 🔹 4️⃣ FINALIZAÇÃO
+    # ==============================
+    try:
+        df_users_final = pd.concat(resultados_users, ignore_index=True) if resultados_users else pd.DataFrame()
+        df_deptos_final = pd.concat(resultados_deptos, ignore_index=True) if resultados_deptos else pd.DataFrame()
+        WebScrapping.log(
+            f" ✌️ Extração concluída: {len(df_users_final)} usuários e {len(df_deptos_final)} departamentos.",
+            "INFO"
         )
+        return df_users_final, df_deptos_final
 
-    def _generate_key(self):
-        """Gera e salva a chave de criptografia."""
-        key = Fernet.generate_key()
-        self.key_file.write_bytes(key)
-        logging.info(f"🔐 Chave gerada e salva em: {self.key_file}")
-        return key
-
-    def _load_key(self):
-        """Lê a chave existente do arquivo."""
-        if not self.key_file.exists():
-            logging.warning("⚠️ Nenhuma chave encontrada. Gerando nova...")
-            return self._generate_key()
-        return self.key_file.read_bytes()
-
-    def encrypt_env(self):
-        """Criptografa o arquivo .env original."""
-        if not self.env_file.exists():
-            logging.error("❌ Arquivo .env não encontrado para criptografar.")
-            return False
-
-        key = self._load_key()
-        fernet = Fernet(key)
-
-        env_data = self.env_file.read_bytes()
-        encrypted_data = fernet.encrypt(env_data)
-        self.enc_file.write_bytes(encrypted_data)
-
-        logging.info(f"✅ Arquivo .env criptografado em: {self.enc_file}")
-
-        # Opcional: apagar o original
-        # self.env_file.unlink()
-        return True
-
-    def decrypt_env(self):
-        """Descriptografa e carrega as variáveis de ambiente."""
-        if not self.enc_file.exists():
-            logging.error("❌ Nenhum arquivo .env.enc encontrado.")
-            return False
-
-        key = self._load_key()
-        fernet = Fernet(key)
-        decrypted_data = fernet.decrypt(self.enc_file.read_bytes()).decode()
-
-        load_dotenv(stream=StringIO(decrypted_data))
-        logging.info("✅ Variáveis de ambiente carregadas com sucesso!")
-        return True
-
-    def auto_manage(self):
-        """
-        Faz o controle automático:
-        - Se existir apenas .env → criptografa
-        - Se existir .env.enc → descriptografa e carrega
-        """
-        if self.env_file.exists() and not self.enc_file.exists():
-            logging.info("📦 Detectado .env puro — iniciando criptografia...")
-            self.encrypt_env()
-            logging.info("✅ Criptografia concluída. Carregando variáveis...")
-            self.decrypt_env()
-
-        elif self.enc_file.exists():
-            logging.info("🔐 Detectado .env criptografado — carregando variáveis...")
-            self.decrypt_env()
-
-        else:
-            logging.error("❌ Nenhum arquivo de ambiente encontrado (.env ou .env.enc).")
-
-
-# Execução direta (caso queira rodar standalone)
-if __name__ == "__main__":
-    manager = SecureEnvManager(Path(__file__).parent)
-    manager.auto_manage()
-
-from config.secure_env_manager import SecureEnvManager
-
-# Inicializa e carrega o ambiente
-config_dir = Path.cwd().parent.parent / "config"
-manager = SecureEnvManager(config_dir)
-manager.auto_manage()
-
+    except Exception as e:
+        WebScrapping.log(f" ❌ Erro ao concatenar DataFrames: {str(e)}", "ERROR")
+        return pd.DataFrame(), pd.DataFrame()
