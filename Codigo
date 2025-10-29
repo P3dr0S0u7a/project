@@ -31,27 +31,28 @@ def extract_method(self, ids: List[str] = None, pin: Optional[str] = None) -> Tu
         WebScrapping.log(f" 🔍 {idx + 1}/{len(ids_validos)} - Processando usuário UID: {uid}", "INFO")
 
         try:
+            # ⚙️ Passa explicitamente o UID, sem sobrescrever o self.parametro
             resultado_user = self.executar_passos(parametro=uid, steps=users_locators, pin=pin)
         except Exception as e:
             WebScrapping.log(f" ❌ Erro ao processar UID {uid}: {str(e)}", "ERROR")
             continue
 
-        # Extração dinâmica de e-mail e departamento
+        # 🔎 Extrai e-mail e departamento do resultado
         email = resultado_user.get("E-mail")
-        depto_id = resultado_user.get("parametro")
+        depto_id = resultado_user.get("UID Setor") or resultado_user.get("Setor ID") or resultado_user.get("parametro")
 
         if not email:
             WebScrapping.log(f" ⚠️ Usuário {uid} sem E-mail. Ignorado.", "WARNING")
             continue
 
-        # Evita reprocessamento
+        # Evita reprocessar o mesmo e-mail
         if email in usuarios_processados:
             continue
 
-        # Substitui o parâmetro atual (UID) pelo e-mail
+        # 🔧 Substitui o parâmetro para uso futuro com o e-mail
         resultado_user["parametro"] = email.strip()
 
-        # Monta o DataFrame de usuário
+        # 🧩 Monta DataFrame de usuário
         df_user = pd.DataFrame([resultado_user]).copy()
         df_user["UID.1"] = uid
         df_user["UID Setor"] = depto_id
@@ -60,6 +61,7 @@ def extract_method(self, ids: List[str] = None, pin: Optional[str] = None) -> Tu
         usuarios_processados.add(email)
         WebScrapping.log(f" ✅ Usuário {uid} ({email}) processado com sucesso.", "INFO")
 
+        # Coleta departamentos a processar
         if depto_id and depto_id not in deptos_a_processar:
             deptos_a_processar.append(depto_id)
 
@@ -72,6 +74,7 @@ def extract_method(self, ids: List[str] = None, pin: Optional[str] = None) -> Tu
         WebScrapping.log(f" 🏢 {idx + 1}/{len(deptos_a_processar)} - Processando setor: {depto_id}", "INFO")
 
         try:
+            # ⚙️ Passa explicitamente o depto_id
             resultado_depto = self.executar_passos(parametro=depto_id, steps=depto_locators, pin=pin)
         except Exception as e:
             WebScrapping.log(f" ❌ Erro ao processar setor '{depto_id}': {str(e)}", "ERROR")
@@ -85,7 +88,7 @@ def extract_method(self, ids: List[str] = None, pin: Optional[str] = None) -> Tu
         if not uid_responsavel:
             WebScrapping.log(f" ⚠️ Setor {depto_id} sem responsável definido.", "WARNING")
 
-        # Monta DataFrame do setor
+        # 🧩 Monta DataFrame do setor
         df_depto = pd.DataFrame([resultado_depto]).copy()
         df_depto["Id Setor.1"] = depto_id
         resultados_deptos.append(df_depto)
@@ -93,7 +96,7 @@ def extract_method(self, ids: List[str] = None, pin: Optional[str] = None) -> Tu
 
         WebScrapping.log(f" ✅ Setor {resultado_depto.get('Setor', '(sem nome)')} processado com sucesso.", "INFO")
 
-        # Adiciona responsável para reprocessar
+        # 🔁 Adiciona responsável para reprocessar (por UID)
         if uid_responsavel and uid_responsavel not in usuarios_a_processar:
             usuarios_a_processar.add(uid_responsavel)
 
@@ -112,13 +115,10 @@ def extract_method(self, ids: List[str] = None, pin: Optional[str] = None) -> Tu
             continue
 
         email = resultado_user.get("E-mail")
-        if not email:
+        if not email or email in usuarios_processados:
             continue
 
-        if email in usuarios_processados:
-            continue
-
-        depto_id = resultado_user.get("parametro")
+        depto_id = resultado_user.get("UID Setor") or resultado_user.get("Setor ID") or resultado_user.get("parametro")
         resultado_user["parametro"] = email.strip()
 
         df_user = pd.DataFrame([resultado_user]).copy()
@@ -135,6 +135,7 @@ def extract_method(self, ids: List[str] = None, pin: Optional[str] = None) -> Tu
     try:
         df_users_final = pd.concat(resultados_users, ignore_index=True) if resultados_users else pd.DataFrame()
         df_deptos_final = pd.concat(resultados_deptos, ignore_index=True) if resultados_deptos else pd.DataFrame()
+
         WebScrapping.log(
             f" ✌️ Extração concluída: {len(df_users_final)} usuários e {len(df_deptos_final)} departamentos.",
             "INFO"
