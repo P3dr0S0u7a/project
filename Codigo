@@ -1,147 +1,123 @@
-def extract_method(self, ids: List[str] = None, pin: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Executa o pipeline de extração de usuários e departamentos de forma totalmente dinâmica,
-    com base nos locators configurados no JSON (sem hardcodes).
-    """
-    resultados_users = []
-    resultados_deptos = []
-    deptos_processados = set()
-    deptos_a_processar = []
-    usuarios_processados = set()
-    usuarios_a_processar = set()
+import os
+import re
+import getpass
+import platform
+import hashlib
+import mimetypes
+import pandas as pd
+from datetime import datetime
+from tqdm import tqdm
 
-    WebScrapping.log(f" 🆔 Iniciando extração com {len(ids) if ids else 0} IDs de origem.", "INFO")
-
-    if not ids:
-        WebScrapping.log(" ⚠️ Lista de IDs vazia recebida", "WARNING")
-        return pd.DataFrame(), pd.DataFrame()
-
-    # Remove duplicados e espaços
-    ids_validos = list(dict.fromkeys([str(id_).strip() for id_ in ids if id_ and str(id_).strip()]))
-
-    # Carrega steps do JSON
-    users_locators = self.locators_global.get("users", {}).get("steps", [])
-    depto_locators = self.locators_global.get("depto", {}).get("steps", [])
-
-    # ==============================
-    # 🔹 1️⃣ PROCESSAMENTO DE USUÁRIOS
-    # ==============================
-    for idx, uid_origem in enumerate(ids_validos):
-        uid = uid_origem
-        WebScrapping.log(f" 🔍 {idx + 1}/{len(ids_validos)} - Processando usuário UID: {uid}", "INFO")
-
-        try:
-            # ⚙️ Passa explicitamente o UID, sem sobrescrever o self.parametro
-            resultado_user = self.executar_passos(parametro=uid, steps=users_locators, pin=pin)
-        except Exception as e:
-            WebScrapping.log(f" ❌ Erro ao processar UID {uid}: {str(e)}", "ERROR")
-            continue
-
-        # 🔎 Extrai e-mail e departamento do resultado
-        email = resultado_user.get("E-mail")
-        depto_id = resultado_user.get("UID Setor") or resultado_user.get("Setor ID") or resultado_user.get("parametro")
-
-        if not email:
-            WebScrapping.log(f" ⚠️ Usuário {uid} sem E-mail. Ignorado.", "WARNING")
-            continue
-
-        # Evita reprocessar o mesmo e-mail
-        if email in usuarios_processados:
-            continue
-
-        # 🔧 Substitui o parâmetro para uso futuro com o e-mail
-        resultado_user["parametro"] = email.strip()
-
-        # 🧩 Monta DataFrame de usuário
-        df_user = pd.DataFrame([resultado_user]).copy()
-        df_user["UID.1"] = uid
-        df_user["UID Setor"] = depto_id
-        resultados_users.append(df_user)
-
-        usuarios_processados.add(email)
-        WebScrapping.log(f" ✅ Usuário {uid} ({email}) processado com sucesso.", "INFO")
-
-        # Coleta departamentos a processar
-        if depto_id and depto_id not in deptos_a_processar:
-            deptos_a_processar.append(depto_id)
-
-    # ==============================
-    # 🔹 2️⃣ PROCESSAMENTO DE DEPARTAMENTOS
-    # ==============================
-    deptos_a_processar = list(dict.fromkeys([d for d in deptos_a_processar if d]))
-
-    for idx, depto_id in enumerate(deptos_a_processar):
-        WebScrapping.log(f" 🏢 {idx + 1}/{len(deptos_a_processar)} - Processando setor: {depto_id}", "INFO")
-
-        try:
-            # ⚙️ Passa explicitamente o depto_id
-            resultado_depto = self.executar_passos(parametro=depto_id, steps=depto_locators, pin=pin)
-        except Exception as e:
-            WebScrapping.log(f" ❌ Erro ao processar setor '{depto_id}': {str(e)}", "ERROR")
-            continue
-
-        if not resultado_depto:
-            WebScrapping.log(f" ⚠️ Setor {depto_id} retornou vazio.", "WARNING")
-            continue
-
-        uid_responsavel = resultado_depto.get("UID Responsável")
-        if not uid_responsavel:
-            WebScrapping.log(f" ⚠️ Setor {depto_id} sem responsável definido.", "WARNING")
-
-        # 🧩 Monta DataFrame do setor
-        df_depto = pd.DataFrame([resultado_depto]).copy()
-        df_depto["Id Setor.1"] = depto_id
-        resultados_deptos.append(df_depto)
-        deptos_processados.add(depto_id)
-
-        WebScrapping.log(f" ✅ Setor {resultado_depto.get('Setor', '(sem nome)')} processado com sucesso.", "INFO")
-
-        # 🔁 Adiciona responsável para reprocessar (por UID)
-        if uid_responsavel and uid_responsavel not in usuarios_a_processar:
-            usuarios_a_processar.add(uid_responsavel)
-
-    # ==============================
-    # 🔹 3️⃣ PROCESSAMENTO DOS RESPONSÁVEIS
-    # ==============================
-    novos_ids_validos = list(dict.fromkeys([u for u in usuarios_a_processar if u]))
-
-    for idx, uid_resp in enumerate(novos_ids_validos):
-        WebScrapping.log(f" 👤 {idx + 1}/{len(novos_ids_validos)} - Processando responsável UID: {uid_resp}", "INFO")
-
-        try:
-            resultado_user = self.executar_passos(parametro=uid_resp, steps=users_locators, pin=pin)
-        except Exception as e:
-            WebScrapping.log(f" ❌ Erro ao processar responsável '{uid_resp}': {str(e)}", "ERROR")
-            continue
-
-        email = resultado_user.get("E-mail")
-        if not email or email in usuarios_processados:
-            continue
-
-        depto_id = resultado_user.get("UID Setor") or resultado_user.get("Setor ID") or resultado_user.get("parametro")
-        resultado_user["parametro"] = email.strip()
-
-        df_user = pd.DataFrame([resultado_user]).copy()
-        df_user["UID.1"] = uid_resp
-        df_user["UID Setor"] = depto_id
-        resultados_users.append(df_user)
-        usuarios_processados.add(email)
-
-        WebScrapping.log(f" ✅ Responsável {uid_resp} ({email}) processado com sucesso.", "INFO")
-
-    # ==============================
-    # 🔹 4️⃣ FINALIZAÇÃO
-    # ==============================
+def gerar_hash_md5(caminho, chunk_size=4096):
+    """Gera hash MD5 de um arquivo (usado para identificar duplicados)."""
     try:
-        df_users_final = pd.concat(resultados_users, ignore_index=True) if resultados_users else pd.DataFrame()
-        df_deptos_final = pd.concat(resultados_deptos, ignore_index=True) if resultados_deptos else pd.DataFrame()
+        hash_md5 = hashlib.md5()
+        with open(caminho, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except Exception:
+        return None
 
-        WebScrapping.log(
-            f" ✌️ Extração concluída: {len(df_users_final)} usuários e {len(df_deptos_final)} departamentos.",
-            "INFO"
-        )
-        return df_users_final, df_deptos_final
 
-    except Exception as e:
-        WebScrapping.log(f" ❌ Erro ao concatenar DataFrames: {str(e)}", "ERROR")
-        return pd.DataFrame(), pd.DataFrame()
+def tamanho_humano(size_bytes):
+    """Converte tamanho em bytes para formato legível (KB, MB, GB)."""
+    for unidade in ['Bytes', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.2f} {unidade}"
+        size_bytes /= 1024
+    return f"{size_bytes:.2f} PB"
+
+
+def mapear_pastas(root_dir, calcular_hash=True):
+    """
+    Mapeia todas as pastas, subpastas e arquivos, coletando informações detalhadas.
+    """
+    dados = []
+    usuario = getpass.getuser()
+    sistema = f"{platform.system()} {platform.release()}"
+
+    for dirpath, _, filenames in tqdm(os.walk(root_dir), desc="🔍 Mapeando arquivos..."):
+        for filename in filenames:
+            caminho = os.path.join(dirpath, filename)
+            try:
+                stats = os.stat(caminho)
+                tipo, _ = mimetypes.guess_type(caminho)
+                extensao = os.path.splitext(filename)[1].lower()
+                unidade = os.path.splitdrive(caminho)[0]
+                nivel = caminho.count(os.sep) - root_dir.count(os.sep)
+                tamanho_bytes = stats.st_size
+                tamanho_mb = round(tamanho_bytes / (1024 * 1024), 3)
+                hash_md5 = gerar_hash_md5(caminho) if calcular_hash else None
+
+                dados.append({
+                    # --- Identificação básica ---
+                    "Arquivo": filename,
+                    "Nome_Sem_Extensao": os.path.splitext(filename)[0],
+                    "Extensao": extensao,
+                    "Pasta": dirpath,
+                    "Caminho_Completo": caminho,
+
+                    # --- Tamanho ---
+                    "Tamanho_Bytes": tamanho_bytes,
+                    "Tamanho_KB": round(tamanho_bytes / 1024, 3),
+                    "Tamanho_MB": tamanho_mb,
+                    "Tamanho_GB": round(tamanho_mb / 1024, 6),
+                    "Tamanho_Humano": tamanho_humano(tamanho_bytes),
+
+                    # --- Datas ---
+                    "Data_Criacao": datetime.fromtimestamp(stats.st_ctime),
+                    "Data_Modificacao": datetime.fromtimestamp(stats.st_mtime),
+                    "Data_Acesso": datetime.fromtimestamp(stats.st_atime),
+                    "Idade_Dias": round((datetime.now() - datetime.fromtimestamp(stats.st_ctime)).days, 1),
+                    "Ultima_Modificacao_Dias": round((datetime.now() - datetime.fromtimestamp(stats.st_mtime)).days, 1),
+
+                    # --- Sistema e usuário ---
+                    "Usuario_Atual": usuario,
+                    "Sistema_Operacional": sistema,
+                    "Unidade": unidade,
+                    "Diretorio_Raiz": os.path.splitdrive(root_dir)[1].split(os.sep)[1] if len(os.path.splitdrive(root_dir)[1].split(os.sep)) > 1 else "",
+                    "Nivel_Pasta": nivel,
+
+                    # --- Tipo e permissões ---
+                    "Tipo_Arquivo": tipo,
+                    "Eh_Arquivo": os.path.isfile(caminho),
+                    "Eh_Pasta": os.path.isdir(caminho),
+                    "Eh_Link_Simbolico": os.path.islink(caminho),
+                    "Permissao_Leitura": os.access(caminho, os.R_OK),
+                    "Permissao_Escrita": os.access(caminho, os.W_OK),
+                    "Permissao_Execucao": os.access(caminho, os.X_OK),
+                    "Permissoes": oct(stats.st_mode)[-3:],
+
+                    # --- Segurança e hash ---
+                    "UID": getattr(stats, "st_uid", None),
+                    "GID": getattr(stats, "st_gid", None),
+                    "Hash_MD5": hash_md5,
+
+                    # --- Análises adicionais ---
+                    "Contem_Numero_No_Nome": bool(re.search(r'\d', filename)),
+                    "Eh_Backup": bool(re.search(r'backup|bkp', filename, re.IGNORECASE)),
+                    "Eh_Temporario": extensao in ['.tmp', '.bak', '.temp', '.old']
+                })
+
+            except Exception as e:
+                print(f"⚠️ Erro ao ler {caminho}: {e}")
+
+    df = pd.DataFrame(dados)
+    return df
+
+
+# ===============================
+# EXEMPLO DE USO
+# ===============================
+if __name__ == "__main__":
+    root_dir = r"C:\Users\Pedro\Documents"  # <-- altere conforme seu diretório
+    df = mapear_pastas(root_dir, calcular_hash=True)
+
+    # Exporta para Excel e CSV
+    df.to_excel("mapeamento_completo.xlsx", index=False)
+    df.to_csv("mapeamento_completo.csv", index=False, encoding="utf-8-sig")
+
+    print("\n✅ Mapeamento concluído com sucesso!")
+    print(f"📦 {len(df)} arquivos mapeados.")
+    print("💾 Arquivos salvos: 'mapeamento_completo.xlsx' e 'mapeamento_completo.csv'")
