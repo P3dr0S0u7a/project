@@ -1,135 +1,38 @@
-from datetime import datetime as dt
-import logging, math, numpy as np, pandas as pd, pyodbc, os, re
-import fitz  # PyMuPDF
-import easyocr
+import os
+import shutil
 
-# Configurações de Ambiente
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-log = logging.getLogger(__name__)
-
-def formatar_documento(numero, tipo):
-    if tipo == "CPF": return f"{numero[:3]}.{numero[3:6]}.{numero[6:9]}-{numero[9:]}" if len(numero) == 11 else numero
-    if tipo == "CNPJ": return f"{numero[:2]}.{numero[2:5]}.{numero[5:8]}/{numero[8:12]}-{numero[12:]}" if len(numero) == 14 else numero
-    return numero
-
-def gerar_variavel_string_split(df):
-    if df.empty: return "DECLARE @Valores TABLE (Page NVARCHAR(MAX));"
-    colunas = list(df.columns)
-    colunas_str = ", ".join([f"[{c}]" for c in colunas])
-    tabela_def = ", ".join([f"[{col}] NVARCHAR(MAX)" for col in colunas])
-    valores = df.astype(str).values.tolist()
-    valores_formatados = [ "(" + ", ".join(["'" + v.replace("'", "''") + "'" for v in linha ]) + ")" for linha in valores ]
-    num_blocos = math.ceil(len(valores_formatados) / 1000)
-    queries = [f"INSERT INTO @Valores ({colunas_str}) VALUES {', '.join(valores_formatados[i*1000:(i+1)*1000])};" for i in range(num_blocos)]
-    return f"SET NOCOUNT ON; DECLARE @Valores TABLE ({tabela_def}); {chr(10).join(queries)}"
-
-# --- CONFIGURAÇÕES ---
-diretorio = r"\\saos003fs03p/ProcessosBI/MIS/Datasources/Juridico/Oficios SUSEP Juridco - PDF PBI/2 in progress/"
-arquivo = os.path.join(diretorio, 'PDF_IMPORT.pdf')
-
-# Regex
-regex_cpf = r"\d{3}\.?\d{3}\.?\d{3}-?\d{2}"
-regex_cnpj = r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}"
-# Regex focado em capturar "Nº 15/2026"
-regex_n_oficio = r"(?:N[º°º]\s*)(\d+)[/\-](\d{4})" 
-
-remove_char = lambda x: re.sub(r"[^\d]", "", x)
-
-linhas_dados_extraidos = []
-identificador_oficio = "00_0000" # Valor default caso não encontre
-
-if os.path.exists(arquivo):
-    reader = easyocr.Reader(['pt', 'en'], gpu=False)
-    doc_pdf = fitz.open(arquivo)
-    
-    log.info(f" Etapa 01/04: Lendo {len(doc_pdf)} páginas...")
-
-    for i, page in enumerate(doc_pdf):
-        page_label = f"Page{i+1:04}"
-        texto_extraido = page.get_text("text").strip()
-        origem_dado = "TEXTO_NATIVO"
-
-        # Se a página 1 não trouxer texto ou não achar o "Nº", força OCR nela para garantir o Ofício
-        if (i == 0 and "Nº" not in texto_extraido) or len(texto_extraido) < 15:
-            log.info(f" -> {page_label}: Acionando OCR (Origem: Imagem)...")
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img_bytes = pix.tobytes("png")
-            texto_extraido = " ".join(reader.readtext(img_bytes, detail=0))
-            origem_dado = "OCR"
-
-        # Captura do Número do Ofício (Apenas na página 1)
-        if i == 0:
-            match = re.search(regex_n_oficio, texto_extraido)
-            if match:
-                num, ano = match.groups()
-                identificador_oficio = f"{num}_{ano}"
-                log.info(f" >>> Ofício Identificado: {identificador_oficio}")
-
-        # Processamento dos documentos
-        if texto_extraido:
-            linhas = texto_extraido.split("\n")
-            for num_linha, linha in enumerate(linhas):
-                for tipo, regex in [("CPF", regex_cpf), ("CNPJ", regex_cnpj)]:
-                    for doc_found in re.findall(regex, linha):
-                        doc_limpo = remove_char(doc_found)
-                        if (tipo == "CPF" and len(doc_limpo) == 11) or (tipo == "CNPJ" and len(doc_limpo) == 14):
-                            linhas_dados_extraidos.append({
-                                "OficioRef": identificador_oficio,
-                                "Page": page_label,
-                                "Linha": num_linha,
-                                "ClienteCpfCnpj": formatar_documento(doc_limpo, tipo),
-                                "ClienteCpfCnpj_formatado": doc_limpo,
-                                "Tipo": tipo,
-                                "Origem": origem_dado, # Nova coluna separada
-                                "TextoOriginal": linha.strip()[:200]
-                            })
-    doc_pdf.close()
-else:
-    log.error("Arquivo PDF não encontrado.")
-
-# --- ETAPA SQL E EXCEL ---
-if linhas_dados_extraidos:
-    pdf_paginas = pd.DataFrame(linhas_dados_extraidos).drop_duplicates(subset=['Page', 'ClienteCpfCnpj_formatado'])
-    query_paginas = gerar_variavel_string_split(pdf_paginas)
-    
-    query_select = """
-    SELECT DISTINCT 
-           v.[OficioRef] AS Oficio
-        ,  c.[ClienteCpfCnpj] AS CPF_CNPJ
-        ,  c.[Page] AS Id
-        ,  v.[Origem] -- Trazendo a nova coluna do OCR/Texto Nativo
-        ,  ce.[CertificadoName]
-        ,  CASE 
-             WHEN sta.[StatusApoliceDescricao] <> 'CANCELADO' and ce.[CertificadoVigenciaFim] < CONVERT(char(8),getdate(),112) THEN 'EXPIRADO'
-             WHEN sta.[StatusApoliceDescricao] <> 'CANCELADO' and ce.[CertificadoVigenciaFim] >= CONVERT(char(8),getdate(),112) THEN 'ATIVO'
-             ELSE sta.[StatusApoliceDescricao] END AS StatusCertificado
-        ,  ce.OrigemDadoId, s.SinistroName
-    FROM (  
-        SELECT c.[ClienteId], c.[OrigemDadoId], v.[ClienteCpfCnpj], v.[Page]
-        FROM [dbDMCardif].[dbo].[Cliente] c
-        JOIN @Valores v ON c.[ClienteCpfCnpj] = v.[ClienteCpfCnpj_formatado]
-      ) c
-    JOIN @Valores v ON c.[ClienteCpfCnpj] = v.[ClienteCpfCnpj_formatado] AND c.[Page] = v.[Page]
-    LEFT JOIN [dbDMCardif].[dbo].[Certificado] ce ON c.[ClienteId] = ce.[ClienteId] AND c.[OrigemDadoId] = ce.[OrigemDadoId]
-    AND ce.[CertificadoEndossoName] = 0 AND CONVERT(char(8),getdate()-1096,112) between ce.[CertificadoVigenciaInicio] and ce.[CertificadoVigenciaFim]
-    LEFT JOIN [dbDMCardif].[dbo].[SinistroEvento] sv ON sv.[CertificadoID] = ce.[CertificadoId]
-    LEFT JOIN [dbDMCardif].[dbo].[Sinistro] s ON s.[SinistroID] = sv.[SinistroID]
-    LEFT JOIN [dbDMCardif].[dbo].[StatusApolice] sta on sta.[StatusApoliceId] = ce.[StatusApoliceId]
-    WHERE ce.CertificadoName IS NOT NULL ORDER BY c.[Page]
+def organizar_arquivos_processados(identificador_oficio, caminho_pdf_original, caminho_excel_gerado):
     """
+    Organiza o PDF e o Excel em uma estrutura de pastas: 3_done > ANO > Ofício XXX_AAAA
+    """
+    base_done = r"\\saos003fs03p\ProcessosBI\MIS\Datasources\Juridico\Oficios SUSEP Juridco - PDF PBI\3_done"
     
     try:
-        conn = pyodbc.connect('DRIVER={SQL Server};SERVER=SAOS005BI01P;Trusted_Connection=yes;')
-        df_final = pd.read_sql(query_paginas + "\n" + query_select, conn)
-        conn.close()
+        # 1. Extrai o ano do identificador (ex: "15_2026" -> "2026")
+        ano = identificador_oficio.split('_')[-1]
         
-        # Nome do arquivo conforme solicitado: ExtFinal_Oficio_XXX_AAAA.xlsx
-        nome_excel = f"ExtFinal_Oficio_{identificador_oficio}.xlsx"
-        caminho_final = os.path.join(diretorio, nome_excel)
+        # 2. Define e cria os caminhos (Ano e Pasta do Ofício)
+        caminho_ano = os.path.join(base_done, ano)
+        caminho_pasta_oficio = os.path.join(caminho_ano, f"Ofício {identificador_oficio}")
         
-        df_final.to_excel(caminho_final, index=False)
-        log.info(f"Sucesso! Arquivo gerado: {nome_excel}")
-        # os.remove(arquivo) # Opcional
+        # os.makedirs com exist_ok=True evita erros se a pasta já existir
+        os.makedirs(caminho_pasta_oficio, exist_ok=True)
+        
+        # 3. Move os arquivos
+        # Pegamos apenas o nome do arquivo para o destino
+        nome_pdf = os.path.basename(caminho_pdf_original)
+        nome_excel = os.path.basename(caminho_excel_gerado)
+        
+        shutil.move(caminho_pdf_original, os.path.join(caminho_pasta_oficio, nome_pdf))
+        shutil.move(caminho_excel_gerado, os.path.join(caminho_pasta_oficio, nome_excel))
+        
+        log.info(f"✔ Arquivos organizados com sucesso em: {caminho_pasta_oficio}")
+        return True
+
     except Exception as e:
-        log.error(f"Erro no SQL/Excel: {e}")
+        log.error(f"✘ Erro ao organizar arquivos: {e}")
+        return False
+
+# --- COMO CHAMAR NO SEU CÓDIGO ---
+# Após salvar o Excel com sucesso:
+organizar_arquivos_processados(identificador_oficio, arquivo, caminho_final)
