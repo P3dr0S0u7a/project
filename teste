@@ -9,10 +9,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 def formatar_documento(numero, tipo):
-    if tipo == "CPF": 
-        return f"{numero[:3]}.{numero[3:6]}.{numero[6:9]}-{numero[9:]}" if len(numero) == 11 else numero
-    if tipo == "CNPJ": 
-        return f"{numero[:2]}.{numero[2:5]}.{numero[5:8]}/{numero[8:12]}-{numero[12:]}" if len(numero) == 14 else numero
+    if tipo == "CPF": return f"{numero[:3]}.{numero[3:6]}.{numero[6:9]}-{numero[9:]}" if len(numero) == 11 else numero
+    if tipo == "CNPJ": return f"{numero[:2]}.{numero[2:5]}.{numero[5:8]}/{numero[8:12]}-{numero[12:]}" if len(numero) == 14 else numero
     return numero
 
 def gerar_variavel_string_split(df):
@@ -23,44 +21,52 @@ def gerar_variavel_string_split(df):
     valores = df.astype(str).values.tolist()
     valores_formatados = [ "(" + ", ".join(["'" + v.replace("'", "''") + "'" for v in linha ]) + ")" for linha in valores ]
     num_blocos = math.ceil(len(valores_formatados) / 1000)
-    queries = [f"INSERT INTO @Valores ({colunas_str}) VALUES {', '.join(valores_formatados[i*1000:(i+1)*1000])};" for i in range(num_bloacos)]
+    queries = [f"INSERT INTO @Valores ({colunas_str}) VALUES {', '.join(valores_formatados[i*1000:(i+1)*1000])};" for i in range(num_blocos)]
     return f"SET NOCOUNT ON; DECLARE @Valores TABLE ({tabela_def}); {chr(10).join(queries)}"
 
-# --- CONFIGURAÇÕES DE DIRETÓRIO ---
+# --- CONFIGURAÇÕES ---
 diretorio = r"\\saos003fs03p/ProcessosBI/MIS/Datasources/Juridico/Oficios SUSEP Juridco - PDF PBI/2 in progress/"
 arquivo = os.path.join(diretorio, 'PDF_IMPORT.pdf')
+
+# Regex
 regex_cpf = r"\d{3}\.?\d{3}\.?\d{3}-?\d{2}"
 regex_cnpj = r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}"
+# Regex focado em capturar "Nº 15/2026"
+regex_n_oficio = r"(?:N[º°º]\s*)(\d+)[/\-](\d{4})" 
+
 remove_char = lambda x: re.sub(r"[^\d]", "", x)
 
 linhas_dados_extraidos = []
+identificador_oficio = "00_0000" # Valor default caso não encontre
 
 if os.path.exists(arquivo):
-    # Inicializa o Reader apenas se necessário (Lazy Loading interno)
     reader = easyocr.Reader(['pt', 'en'], gpu=False)
     doc_pdf = fitz.open(arquivo)
     
-    log.info(f" Etapa 01/04: Iniciando leitura inteligente de {len(doc_pdf)} páginas.")
+    log.info(f" Etapa 01/04: Lendo {len(doc_pdf)} páginas...")
 
     for i, page in enumerate(doc_pdf):
         page_label = f"Page{i+1:04}"
-        
-        # --- PASSO 1: TENTAR LEITURA DE TEXTO NATIVO (RÁPIDO) ---
         texto_extraido = page.get_text("text").strip()
-        origem = "TEXTO_NATIVO"
+        origem_dado = "TEXTO_NATIVO"
 
-        # --- PASSO 2: SE O TEXTO FOR INSUFICIENTE, TENTAR OCR (PESADO) ---
-        if len(texto_extraido) < 15:
-            log.info(f" -> {page_label}: Imagem detectada (ou texto insuficiente). Acionando OCR...")
+        # Se a página 1 não trouxer texto ou não achar o "Nº", força OCR nela para garantir o Ofício
+        if (i == 0 and "Nº" not in texto_extraido) or len(texto_extraido) < 15:
+            log.info(f" -> {page_label}: Acionando OCR (Origem: Imagem)...")
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             img_bytes = pix.tobytes("png")
-            resultado_ocr = reader.readtext(img_bytes, detail=0)
-            texto_extraido = " ".join(resultado_ocr)
-            origem = "OCR_IMAGEM"
-        else:
-            log.info(f" -> {page_label}: Lido via Texto Nativo.")
+            texto_extraido = " ".join(reader.readtext(img_bytes, detail=0))
+            origem_dado = "OCR"
 
-        # --- PASSO 3: PROCESSAR O RESULTADO IDENTIFICADO ---
+        # Captura do Número do Ofício (Apenas na página 1)
+        if i == 0:
+            match = re.search(regex_n_oficio, texto_extraido)
+            if match:
+                num, ano = match.groups()
+                identificador_oficio = f"{num}_{ano}"
+                log.info(f" >>> Ofício Identificado: {identificador_oficio}")
+
+        # Processamento dos documentos
         if texto_extraido:
             linhas = texto_extraido.split("\n")
             for num_linha, linha in enumerate(linhas):
@@ -69,35 +75,42 @@ if os.path.exists(arquivo):
                         doc_limpo = remove_char(doc_found)
                         if (tipo == "CPF" and len(doc_limpo) == 11) or (tipo == "CNPJ" and len(doc_limpo) == 14):
                             linhas_dados_extraidos.append({
+                                "OficioRef": identificador_oficio,
                                 "Page": page_label,
                                 "Linha": num_linha,
                                 "ClienteCpfCnpj": formatar_documento(doc_limpo, tipo),
                                 "ClienteCpfCnpj_formatado": doc_limpo,
                                 "Tipo": tipo,
-                                "Texto": f"[{origem}] " + linha.strip()[:200]
+                                "Origem": origem_dado, # Nova coluna separada
+                                "TextoOriginal": linha.strip()[:200]
                             })
     doc_pdf.close()
 else:
-    log.error("Arquivo não encontrado.")
+    log.error("Arquivo PDF não encontrado.")
 
-# --- ETAPA SQL E EXCEL (PRODUÇÃO) ---
-pdf_paginas = pd.DataFrame(linhas_dados_extraidos)
-if not pdf_paginas.empty:
-    pdf_paginas = pdf_paginas.drop_duplicates(subset=['Page', 'ClienteCpfCnpj_formatado'])
-    log.info(f" Etapa 02/04: Extração concluída. Total: {len(pdf_paginas)} registros.")
-
+# --- ETAPA SQL E EXCEL ---
+if linhas_dados_extraidos:
+    pdf_paginas = pd.DataFrame(linhas_dados_extraidos).drop_duplicates(subset=['Page', 'ClienteCpfCnpj_formatado'])
     query_paginas = gerar_variavel_string_split(pdf_paginas)
     
-    # Query de consulta (Mantida igual a sua original)
     query_select = """
-    SELECT DISTINCT c.[ClienteCpfCnpj] AS CPF_CNPJ, c.[Page] AS Id, c.[Tipo], ce.[CertificadoName],
-    CASE WHEN sta.[StatusApoliceDescricao] <> 'CANCELADO' and ce.[CertificadoVigenciaFim] < CONVERT(char(8),getdate(),112) THEN 'EXPIRADO'
-         WHEN sta.[StatusApoliceDescricao] <> 'CANCELADO' and ce.[CertificadoVigenciaFim] >= CONVERT(char(8),getdate(),112) THEN 'ATIVO'
-         ELSE sta.[StatusApoliceDescricao] END AS StatusCertificado,
-    ce.OrigemDadoId, ce.[CertificadoVigenciaInicio], ce.[CertificadoVigenciaFim], s.SinistroName
-    FROM (SELECT c.[ClienteId], c.[OrigemDadoId], c.[ClienteName], v.[ClienteCpfCnpj], v.[Page], v.[Tipo]
-          FROM [dbDMCardif].[dbo].[Cliente] c
-          JOIN @Valores v ON c.[ClienteCpfCnpj] = v.[ClienteCpfCnpj_formatado]) c
+    SELECT DISTINCT 
+           v.[OficioRef] AS Oficio
+        ,  c.[ClienteCpfCnpj] AS CPF_CNPJ
+        ,  c.[Page] AS Id
+        ,  v.[Origem] -- Trazendo a nova coluna do OCR/Texto Nativo
+        ,  ce.[CertificadoName]
+        ,  CASE 
+             WHEN sta.[StatusApoliceDescricao] <> 'CANCELADO' and ce.[CertificadoVigenciaFim] < CONVERT(char(8),getdate(),112) THEN 'EXPIRADO'
+             WHEN sta.[StatusApoliceDescricao] <> 'CANCELADO' and ce.[CertificadoVigenciaFim] >= CONVERT(char(8),getdate(),112) THEN 'ATIVO'
+             ELSE sta.[StatusApoliceDescricao] END AS StatusCertificado
+        ,  ce.OrigemDadoId, s.SinistroName
+    FROM (  
+        SELECT c.[ClienteId], c.[OrigemDadoId], v.[ClienteCpfCnpj], v.[Page]
+        FROM [dbDMCardif].[dbo].[Cliente] c
+        JOIN @Valores v ON c.[ClienteCpfCnpj] = v.[ClienteCpfCnpj_formatado]
+      ) c
+    JOIN @Valores v ON c.[ClienteCpfCnpj] = v.[ClienteCpfCnpj_formatado] AND c.[Page] = v.[Page]
     LEFT JOIN [dbDMCardif].[dbo].[Certificado] ce ON c.[ClienteId] = ce.[ClienteId] AND c.[OrigemDadoId] = ce.[OrigemDadoId]
     AND ce.[CertificadoEndossoName] = 0 AND CONVERT(char(8),getdate()-1096,112) between ce.[CertificadoVigenciaInicio] and ce.[CertificadoVigenciaFim]
     LEFT JOIN [dbDMCardif].[dbo].[SinistroEvento] sv ON sv.[CertificadoID] = ce.[CertificadoId]
@@ -108,15 +121,15 @@ if not pdf_paginas.empty:
     
     try:
         conn = pyodbc.connect('DRIVER={SQL Server};SERVER=SAOS005BI01P;Trusted_Connection=yes;')
-        df_sql = pd.read_sql(query_paginas + "\n" + query_select, conn)
+        df_final = pd.read_sql(query_paginas + "\n" + query_select, conn)
         conn.close()
         
-        # Exportação final
-        nome_excel = f"ExtFinal_Oficio_{dt.now().strftime('%m_%Y')}.xlsx"
-        df_sql.to_excel(os.path.join(diretorio, nome_excel), index=False)
-        log.info(f"Sucesso: {nome_excel}")
-        os.remove(arquivo) # Remove o PDF processado
+        # Nome do arquivo conforme solicitado: ExtFinal_Oficio_XXX_AAAA.xlsx
+        nome_excel = f"ExtFinal_Oficio_{identificador_oficio}.xlsx"
+        caminho_final = os.path.join(diretorio, nome_excel)
+        
+        df_final.to_excel(caminho_final, index=False)
+        log.info(f"Sucesso! Arquivo gerado: {nome_excel}")
+        # os.remove(arquivo) # Opcional
     except Exception as e:
-        log.error(f"Erro no processamento SQL: {e}")
-else:
-    log.warning("Nenhum dado encontrado para processar.")
+        log.error(f"Erro no SQL/Excel: {e}")
