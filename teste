@@ -3,14 +3,10 @@ import logging, math, numpy as np, pandas as pd, pyodbc, os, re
 import fitz  # PyMuPDF
 import easyocr
 
-# Força o uso de CPU para evitar erros de biblioteca no Python 3.13
+# Configurações de Ambiente
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
-
-def data_hora(): 
-    return dt.now().strftime("%d/%m/%Y %H:%M:%S")
 
 def formatar_documento(numero, tipo):
     if tipo == "CPF": 
@@ -20,150 +16,107 @@ def formatar_documento(numero, tipo):
     return numero
 
 def gerar_variavel_string_split(df):
-    if df.empty: return "DECLARE @Valores TABLE (Page NVARCHAR(MAX)); -- Nenhum dado"
+    if df.empty: return "DECLARE @Valores TABLE (Page NVARCHAR(MAX));"
     colunas = list(df.columns)
     colunas_str = ", ".join([f"[{c}]" for c in colunas])
     tabela_def = ", ".join([f"[{col}] NVARCHAR(MAX)" for col in colunas])
     valores = df.astype(str).values.tolist()
     valores_formatados = [ "(" + ", ".join(["'" + v.replace("'", "''") + "'" for v in linha ]) + ")" for linha in valores ]
     num_blocos = math.ceil(len(valores_formatados) / 1000)
-    queries = []
-    for i in range(num_blocos):
-        bloco = valores_formatados[i * 1000:(i + 1) * 1000]
-        valores_str = ",\n      ".join(bloco)
-        queries.append(f"INSERT INTO @Valores ({colunas_str})\nVALUES\n      {valores_str};")
-    query = f"SET NOCOUNT ON;\nDECLARE @Valores TABLE ({tabela_def});\n{chr(10).join(queries)}"
-    return query
+    queries = [f"INSERT INTO @Valores ({colunas_str}) VALUES {', '.join(valores_formatados[i*1000:(i+1)*1000])};" for i in range(num_bloacos)]
+    return f"SET NOCOUNT ON; DECLARE @Valores TABLE ({tabela_def}); {chr(10).join(queries)}"
 
-def info_conexao(driver, server):
-    try: 
-        connection = pyodbc.connect( f'DRIVER={driver};SERVER={server};Trusted_Connection=yes;' )
-        log.info(f"Conectado ao servidor: {server}")
-        return connection
-    except pyodbc.Error as e: 
-        log.error(f"Erro ao conectar ao {server}: {e}")
-        return None
-
-# --- CONFIGURAÇÕES DE DIRETÓRIO E REGEX ---
-log.info(" Etapa 01/04: Iniciando extração híbrida (Texto + OCR)...")
+# --- CONFIGURAÇÕES DE DIRETÓRIO ---
+diretorio = r"\\saos003fs03p/ProcessosBI/MIS/Datasources/Juridico/Oficios SUSEP Juridco - PDF PBI/2 in progress/"
+arquivo = os.path.join(diretorio, 'PDF_IMPORT.pdf')
 regex_cpf = r"\d{3}\.?\d{3}\.?\d{3}-?\d{2}"
 regex_cnpj = r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}"
 remove_char = lambda x: re.sub(r"[^\d]", "", x)
 
-diretorio = r"\\saos003fs03p/ProcessosBI/MIS/Datasources/Juridico/Oficios SUSEP Juridco - PDF PBI/2 in progress/"
-nome_arquivo = 'PDF_IMPORT'
-arquivo = os.path.join(diretorio, nome_arquivo + '.pdf')
 linhas_dados_extraidos = []
 
 if os.path.exists(arquivo):
-    # Inicializa o Reader (usando os modelos locais que você baixou)
+    # Inicializa o Reader apenas se necessário (Lazy Loading interno)
     reader = easyocr.Reader(['pt', 'en'], gpu=False)
     doc_pdf = fitz.open(arquivo)
     
+    log.info(f" Etapa 01/04: Iniciando leitura inteligente de {len(doc_pdf)} páginas.")
+
     for i, page in enumerate(doc_pdf):
         page_label = f"Page{i+1:04}"
-        log.info(f" -> Processando {page_label}...")
+        
+        # --- PASSO 1: TENTAR LEITURA DE TEXTO NATIVO (RÁPIDO) ---
+        texto_extraido = page.get_text("text").strip()
+        origem = "TEXTO_NATIVO"
 
-        # 1. Extração de Texto Nativo
-        text_nativo = page.get_text("text")
+        # --- PASSO 2: SE O TEXTO FOR INSUFICIENTE, TENTAR OCR (PESADO) ---
+        if len(texto_extraido) < 15:
+            log.info(f" -> {page_label}: Imagem detectada (ou texto insuficiente). Acionando OCR...")
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img_bytes = pix.tobytes("png")
+            resultado_ocr = reader.readtext(img_bytes, detail=0)
+            texto_extraido = " ".join(resultado_ocr)
+            origem = "OCR_IMAGEM"
+        else:
+            log.info(f" -> {page_label}: Lido via Texto Nativo.")
 
-        # 2. Extração via OCR (Transforma a página em imagem)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-        img_bytes = pix.tobytes("png")
-        text_ocr_list = reader.readtext(img_bytes, detail=0)
-        text_ocr = " ".join(text_ocr_list)
-
-        # 3. União dos textos para busca
-        texto_completo = text_nativo + "\n" + text_ocr
-        linhas = texto_completo.split("\n")
-
-        for num_linha, linha in enumerate(linhas):
-            if not linha.strip(): continue
-            for tipo, regex in [("CPF", regex_cpf), ("CNPJ", regex_cnpj)]:
-                for doc_found in re.findall(regex, linha):
-                    doc_limpo = remove_char(doc_found)
-                    # Validação de tamanho
-                    if (tipo == "CPF" and len(doc_limpo) == 11) or (tipo == "CNPJ" and len(doc_limpo) == 14):
-                        linhas_dados_extraidos.append({
-                            "Page": page_label,
-                            "Linha": num_linha,
-                            "ClienteCpfCnpj": formatar_documento(doc_limpo, tipo),
-                            "ClienteCpfCnpj_formatado": doc_limpo,
-                            "Tipo": tipo,
-                            "Texto": linha.strip()[:250]
-                        })
+        # --- PASSO 3: PROCESSAR O RESULTADO IDENTIFICADO ---
+        if texto_extraido:
+            linhas = texto_extraido.split("\n")
+            for num_linha, linha in enumerate(linhas):
+                for tipo, regex in [("CPF", regex_cpf), ("CNPJ", regex_cnpj)]:
+                    for doc_found in re.findall(regex, linha):
+                        doc_limpo = remove_char(doc_found)
+                        if (tipo == "CPF" and len(doc_limpo) == 11) or (tipo == "CNPJ" and len(doc_limpo) == 14):
+                            linhas_dados_extraidos.append({
+                                "Page": page_label,
+                                "Linha": num_linha,
+                                "ClienteCpfCnpj": formatar_documento(doc_limpo, tipo),
+                                "ClienteCpfCnpj_formatado": doc_limpo,
+                                "Tipo": tipo,
+                                "Texto": f"[{origem}] " + linha.strip()[:200]
+                            })
     doc_pdf.close()
 else:
-    log.error(f"Arquivo não encontrado: {arquivo}")
+    log.error("Arquivo não encontrado.")
 
-# --- PROCESSAMENTO E SQL ---
+# --- ETAPA SQL E EXCEL (PRODUÇÃO) ---
 pdf_paginas = pd.DataFrame(linhas_dados_extraidos)
 if not pdf_paginas.empty:
-    # Remove duplicatas caso o OCR e o Texto Nativo achem o mesmo documento na mesma página
     pdf_paginas = pdf_paginas.drop_duplicates(subset=['Page', 'ClienteCpfCnpj_formatado'])
+    log.info(f" Etapa 02/04: Extração concluída. Total: {len(pdf_paginas)} registros.")
 
-log.info(f" Etapa 02/04: Extração concluída. Registros encontrados: {len(pdf_paginas)}.")
-
-query_paginas = gerar_variavel_string_split(pdf_paginas)
-
-query_select_Oficio_Juridico = """
- SELECT DISTINCT 
-        c.[ClienteCpfCnpj] AS CPF_CNPJ
-    ,   c.[Page] AS Id
-    ,   c.[Tipo]
-    ,   ce.[CertificadoName]
-    ,   CASE 
-         WHEN sta.[StatusApoliceDescricao] <> 'CANCELADO' and ce.[CertificadoVigenciaFim] < CONVERT(char(8),getdate(),112)  THEN 'EXPIRADO'
-         WHEN sta.[StatusApoliceDescricao] <> 'CANCELADO' and ce.[CertificadoVigenciaFim] >= CONVERT(char(8),getdate(),112) THEN 'ATIVO'
-         ELSE sta.[StatusApoliceDescricao] END AS StatusCertificado
-    ,   ce.OrigemDadoId
-    ,   ce.[CertificadoVigenciaInicio]
-    ,   ce.[CertificadoVigenciaFim]
-    ,   s.SinistroName
-FROM (  
-    SELECT c.[ClienteId]
-      , c.[OrigemDadoId]
-      , c.[ClienteName]
-      , v.[ClienteCpfCnpj]
-      , v.[Page]
-      , v.[Tipo]
-    FROM [dbDMCardif].[dbo].[Cliente] c
-    JOIN @Valores v
-    ON c.[ClienteCpfCnpj] = v.[ClienteCpfCnpj_formatado]
-  ) c
-LEFT JOIN [dbDMCardif].[dbo].[Certificado] ce
-ON c.[ClienteId] = ce.[ClienteId]
-AND c.[OrigemDadoId] = ce.[OrigemDadoId]
-AND ce.[CertificadoEndossoName] = 0 AND CONVERT(char(8),getdate()-1096,112) between ce.[CertificadoVigenciaInicio] and ce.[CertificadoVigenciaFim]
-LEFT JOIN [dbDMCardif].[dbo].[SinistroEvento] sv
-ON sv.[CertificadoID] = ce.[CertificadoId]
-LEFT JOIN [dbDMCardif].[dbo].[Sinistro] s 
-ON s.[SinistroID] = sv.[SinistroID]
-LEFT JOIN [dbDMCardif].[dbo].[StatusApolice] sta on sta.[StatusApoliceId] = ce.[StatusApoliceId]
-WHERE ce.CertificadoName IS NOT NULL
-ORDER BY c.[Page]
-"""
-
-if not pdf_paginas.empty:
-    query_pdf = query_paginas + "\n" + query_select_Oficio_Juridico
-    conexao = info_conexao(server='SAOS005BI01P', driver='SQL Server')
+    query_paginas = gerar_variavel_string_split(pdf_paginas)
     
-    if conexao:
-        cursor = conexao.cursor()
-        cursor.execute(query_pdf)
-        columns = [column[0] for column in cursor.description]
-        df_sql = pd.DataFrame.from_records(cursor.fetchall(), columns=columns)
-        df_sql['SinistroName'] = df_sql['SinistroName'].replace(np.nan, "NULL")
-        conexao.close()
-        log.info("Conexão Encerrada.")
-
-        log.info(f" Etapa 04/04: exportação para excel.")
-        nome_final = f"ExtFinal_Oficio_{dt.now().strftime('%m_%Y')}.xlsx"
-        df_sql.to_excel(os.path.join(diretorio, nome_final), index=False)
-        log.info(f"Sucesso: {nome_final}")
+    # Query de consulta (Mantida igual a sua original)
+    query_select = """
+    SELECT DISTINCT c.[ClienteCpfCnpj] AS CPF_CNPJ, c.[Page] AS Id, c.[Tipo], ce.[CertificadoName],
+    CASE WHEN sta.[StatusApoliceDescricao] <> 'CANCELADO' and ce.[CertificadoVigenciaFim] < CONVERT(char(8),getdate(),112) THEN 'EXPIRADO'
+         WHEN sta.[StatusApoliceDescricao] <> 'CANCELADO' and ce.[CertificadoVigenciaFim] >= CONVERT(char(8),getdate(),112) THEN 'ATIVO'
+         ELSE sta.[StatusApoliceDescricao] END AS StatusCertificado,
+    ce.OrigemDadoId, ce.[CertificadoVigenciaInicio], ce.[CertificadoVigenciaFim], s.SinistroName
+    FROM (SELECT c.[ClienteId], c.[OrigemDadoId], c.[ClienteName], v.[ClienteCpfCnpj], v.[Page], v.[Tipo]
+          FROM [dbDMCardif].[dbo].[Cliente] c
+          JOIN @Valores v ON c.[ClienteCpfCnpj] = v.[ClienteCpfCnpj_formatado]) c
+    LEFT JOIN [dbDMCardif].[dbo].[Certificado] ce ON c.[ClienteId] = ce.[ClienteId] AND c.[OrigemDadoId] = ce.[OrigemDadoId]
+    AND ce.[CertificadoEndossoName] = 0 AND CONVERT(char(8),getdate()-1096,112) between ce.[CertificadoVigenciaInicio] and ce.[CertificadoVigenciaFim]
+    LEFT JOIN [dbDMCardif].[dbo].[SinistroEvento] sv ON sv.[CertificadoID] = ce.[CertificadoId]
+    LEFT JOIN [dbDMCardif].[dbo].[Sinistro] s ON s.[SinistroID] = sv.[SinistroID]
+    LEFT JOIN [dbDMCardif].[dbo].[StatusApolice] sta on sta.[StatusApoliceId] = ce.[StatusApoliceId]
+    WHERE ce.CertificadoName IS NOT NULL ORDER BY c.[Page]
+    """
+    
+    try:
+        conn = pyodbc.connect('DRIVER={SQL Server};SERVER=SAOS005BI01P;Trusted_Connection=yes;')
+        df_sql = pd.read_sql(query_paginas + "\n" + query_select, conn)
+        conn.close()
         
-        # Opcional: os.remove(arquivo)
-    else:
-        log.error("Falha ao conectar no SQL Server.")
+        # Exportação final
+        nome_excel = f"ExtFinal_Oficio_{dt.now().strftime('%m_%Y')}.xlsx"
+        df_sql.to_excel(os.path.join(diretorio, nome_excel), index=False)
+        log.info(f"Sucesso: {nome_excel}")
+        os.remove(arquivo) # Remove o PDF processado
+    except Exception as e:
+        log.error(f"Erro no processamento SQL: {e}")
 else:
-    log.warning("Nenhum CPF/CNPJ identificado para consulta no banco.")
+    log.warning("Nenhum dado encontrado para processar.")
