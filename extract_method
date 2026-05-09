@@ -1,0 +1,137 @@
+    def extract_method(self, ids: List[str] = None, pin: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]: 
+        resultados_users = []
+        resultados_deptos = []
+        deptos_processados = set()
+        deptos_a_processar = []
+        usuario_processados = set()
+        # Inicializa como lista vazia para evitar erro de referência
+        novos_ids_validos = []
+
+        WebScrapping.log(f" 🆔 IDs unificados atualizados com {len(ids)} novos IDs do sistema.", "INFO")
+        
+        if not ids: 
+            WebScrapping.log(" ⚠️ Lista de IDs vazia recebida", "WARNING")
+            return pd.DataFrame(), pd.DataFrame()
+
+        ids_validos = list(dict.fromkeys([str(id_).strip() for id_ in ids if id_ and str(id_).strip()]))
+        users_locators = self.locators_global.get("users", {}).get("steps", [])
+        depto_locators = self.locators_global.get("depto", {}).get("steps", [])
+
+        # --- FASE 1: Processamento de Colaboradores Inicial ---
+        for idx, uid in enumerate(ids_validos): 
+            try: 
+                field = 'UID'
+                WebScrapping.log(f" 🔍 {idx+1} de {len(ids_validos)} Processando usuário UID: {uid}", "INFO")
+                resultado_user = self.executar_passos(parametro=uid, steps=users_locators, pin=pin)
+                
+                attempt = 0
+                max_attempt = 3
+                while uid != resultado_user.get(field) and attempt < max_attempt:
+                    resultado_user = self.executar_passos(parametro=uid, steps=users_locators, pin=pin)
+                    attempt += 1
+
+                email = resultado_user.get('E-mail')
+                if email and email not in usuario_processados:  
+                    depto_id = str(resultado_user.get('parametro', '')).strip()
+                    df_user = pd.DataFrame([resultado_user]).copy()
+                    df_user['UID.1'] = uid
+                    df_user['UID Setor'] = depto_id
+                    
+                    resultados_users.append(df_user)
+                    usuario_processados.add(email)
+                    WebScrapping.log(f" ✅ Usuário {uid} {email} processado com sucesso", "INFO")
+                    
+                    if depto_id and depto_id not in deptos_a_processar: 
+                        deptos_a_processar.append(depto_id)
+
+            except StaleElementReferenceException: 
+                WebScrapping.log(f" 🔴 [STALE] Erro em processar {uid}, tentando novamente...", "WARNING")
+                # Tenta uma última vez em caso de Stale
+                try:
+                    resultado_user = self.executar_passos(parametro=uid, steps=users_locators, pin=pin)
+                except: pass
+            except Exception as e: 
+                WebScrapping.log(f" ❌ Erro crítico ao processar usuário '{uid}': {str(e)}", "ERROR")
+                continue
+
+        # --- FASE 2: Processamento de Setores ---
+        # Removendo duplicatas mantendo a ordem
+        deptos_unique = list(dict.fromkeys(deptos_a_processar))
+        
+        for idx, depto_id in enumerate(deptos_unique):
+            try:  
+                field_setor = 'UID Setor'
+                WebScrapping.log(f" 🔍 {idx+1} de {len(deptos_unique)} Processando Setor: {depto_id}", "INFO")
+                resultado_depto = self.executar_passos(parametro=depto_id, steps=depto_locators, pin=pin)
+                
+                attempt = 0
+                max_attempt = 3
+                while depto_id != resultado_depto.get(field_setor) and attempt < max_attempt:
+                    resultado_depto = self.executar_passos(parametro=depto_id, steps=depto_locators, pin=pin)
+                    attempt += 1
+
+                if resultado_depto.get(field_setor) and depto_id not in deptos_processados:
+                    df_depto = pd.DataFrame([resultado_depto]).copy()
+                    df_depto['Id Setor.1'] = depto_id
+                    
+                    # CORREÇÃO DO KEYERROR: 'UID Responsável'
+                    responsavel_key = 'UID Responsável'
+                    val_resp = resultado_depto.get(responsavel_key)
+                    
+                    if val_resp:
+                        # Extrai o valor se for um dicionário (padrão do seu log) ou string direta
+                        if isinstance(val_resp, dict):
+                            uid_final = str(val_resp.get('parametro', '')).strip()
+                        else:
+                            uid_final = str(val_resp).strip()
+                        
+                        df_depto[responsavel_key] = uid_final
+                        # Adiciona para a próxima fase de processamento de usuários
+                        novos_ids_validos.append(uid_final)
+                    else:
+                        WebScrapping.log(f" ⚠️ Campo '{responsavel_key}' não encontrado nos resultados do setor {depto_id}", "WARNING")
+                        df_depto[responsavel_key] = None
+
+                    resultados_deptos.append(df_depto)
+                    deptos_processados.add(depto_id)
+                    WebScrapping.log(f" ✅ UID Setor: {depto_id}, Setor: {resultado_depto.get('Setor')} processado", "INFO")
+
+            except Exception as e:
+                WebScrapping.log(f" ❌ Erro ao processar setor '{depto_id}': {str(e)}", "ERROR")
+
+        # --- FASE 3: Processamento dos Responsáveis (Novos IDs) ---
+        # Filtra IDs válidos e únicos que ainda não foram processados
+        novos_ids_unicos = [str(i).strip() for i in novos_ids_validos if i and str(i).strip()]
+        novos_ids_unicos = list(dict.fromkeys(novos_ids_unicos))
+
+        for idx, uid in enumerate(novos_ids_unicos): 
+            try: 
+                # Verifica se já processamos este UID na Fase 1 para evitar loop infinito ou trabalho duplicado
+                # (Opcional: se quiser re-processar, remova a verificação de e-mail abaixo)
+                WebScrapping.log(f" 🔍 {idx+1} de {len(novos_ids_unicos)} Processando Responsável UID: {uid}", "INFO")
+                resultado_user = self.executar_passos(parametro=uid, steps=users_locators, pin=pin)
+                
+                email = resultado_user.get('E-mail')
+                if email and email not in usuario_processados:  
+                    depto_id_resp = str(resultado_user.get('parametro', '')).strip()
+                    df_user_resp = pd.DataFrame([resultado_user]).copy()
+                    df_user_resp['UID.1'] = uid
+                    df_user_resp['UID Setor'] = depto_id_resp
+                    
+                    resultados_users.append(df_user_resp)
+                    usuario_processados.add(email)
+                    WebScrapping.log(f" ✅ Responsável {uid} processado com sucesso", "INFO")
+
+            except Exception as e: 
+                WebScrapping.log(f" ❌ Erro ao processar responsável '{uid}': {str(e)}", "ERROR")
+
+        # --- FINALIZAÇÃO ---
+        try:
+            df_users_final = pd.concat(resultados_users, ignore_index=True) if resultados_users else pd.DataFrame()
+            df_deptos_final = pd.concat(resultados_deptos, ignore_index=True) if resultados_deptos else pd.DataFrame()
+            
+            WebScrapping.log(f" ✌️ Processamento concluído: {len(df_users_final)} usuários, {len(df_deptos_final)} setores", "INFO")
+            return df_users_final, df_deptos_final
+        except Exception as e: 
+            WebScrapping.log(f" ❌ Erro ao concatenar DataFrames: {str(e)}", "ERROR")
+            return pd.DataFrame(), pd.DataFrame()
