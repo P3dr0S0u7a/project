@@ -1,0 +1,67 @@
+    def aguardar_download(self, extensao, downloads_formatos, arquivo_base=None, remover_originais=True, timeout=180): 
+        diretorio = os.path.join(Path.home(), 'Downloads')
+        if extensao not in downloads_formatos: 
+            raise Exception(f" ❌ Extensão {extensao} não está configurada no JSON")
+        
+        cfg = downloads_formatos[extensao]
+        if not cfg: 
+            self.log(f" ❌ Extensão {extensao} não está configurada no JSON", "ERROR")
+            return None
+            
+        reader_func = eval(cfg["reader"]) 
+        reader_params = cfg.get("params", {})
+        
+        self.log(f" ⌛ Aguardando download do tipo: {extensao} (Filtro: '{arquivo_base}')... ", "INFO")
+        tempo_inicial = time.time()
+        
+        while (time.time() - tempo_inicial) < timeout:
+            try: 
+                todos_arquivos = os.listdir(diretorio)
+
+                # Ignora arquivos temporários de download ativo
+                if any(f.endswith('.crdownload') or f.endswith('.tmp') or '.tmp' in f.lower() for f in todos_arquivos):
+                    time.sleep(1)
+                    continue 
+                
+                # Filtra pela extensão correta
+                arquivos = [f for f in todos_arquivos if f.endswith(extensao)]
+                
+                # Filtro inteligente com .strip() para ignorar espaços extras nas pontas
+                if arquivo_base: 
+                    base_limpa = arquivo_base.strip().lower()
+                    arquivos = [f for f in arquivos if base_limpa in f.lower()]
+                
+                if not arquivos: 
+                    time.sleep(1)
+                    continue 
+                
+                # Pega o arquivo mais recente modificado na pasta
+                arquivos.sort(key=lambda x: os.path.getmtime(os.path.join(diretorio, x)), reverse=True)
+                caminho = os.path.join(diretorio, arquivos[0])
+                
+                # Tenta abrir o arquivo para garantir que o SO já liberou a escrita
+                try: 
+                    with open(caminho, 'rb'): 
+                        pass
+                except IOError:  
+                    time.sleep(1)
+                    continue 
+                
+                # Lê o dataframe e remove o arquivo original se configurado
+                df = reader_func(caminho, **reader_params)
+                
+                if remover_originais: 
+                    os.remove(caminho)
+                    self.log(f" ✅ Arquivo carregado e removido: {os.path.basename(caminho)}", "INFO")
+                else: 
+                    self.log(f" ✅ Arquivo carregado: {os.path.basename(caminho)}", "INFO")  
+                
+                return df
+                
+            except Exception as e: 
+                print(f"Erro temporário na leitura da pasta: {e}")
+                time.sleep(1)
+                continue
+                
+        self.log(f" ❌ Timeout: O arquivo {extensao} com palavra-chave '{arquivo_base}' não apareceu a tempo", "ERROR")
+        raise TimeoutError(f"Timeout de {timeout} segundos excedido ao baixar arquivo.")
